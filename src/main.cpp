@@ -215,7 +215,6 @@ static void sizeChanged(int id){
     if(sizingFields||!controls.count(LockRatio)||SendMessageW(controls[LockRatio],BM_GETCHECK,0,0)!=BST_CHECKED)return;
     int n;if(!number(value(id),id==Width?160:120,id==Width?7680:4320,n))return;
     int paired=pairedDimension(n,id==Width?ratioWidth:ratioHeight,id==Width?ratioHeight:ratioWidth);
-    if(paired<(id==Width?120:160)||paired>(id==Width?4320:7680))return;
     sizingFields=true;set(id==Width?Height:Width,std::to_wstring(paired));sizingFields=false;
 }
 static SIZE outerSize(const Target& t,int width,int height){
@@ -441,6 +440,7 @@ static bool selfTest(const S& dir){
     RECT footer{};GetWindowRect(statusWindow,&footer);MapWindowPoints(nullptr,panel,(POINT*)&footer,2);check(footer.left==px(24)&&footer.right==client.right-px(24)&&footer.bottom<=client.bottom-px(10),"footer horizontal and bottom padding");
     set(Width,L"568");check(value(Height)==L"320","editing width follows locked aspect ratio");set(Height,L"160");check(value(Width)==L"284","editing height follows locked aspect ratio");
     SendMessageW(controls[LockRatio],BM_SETCHECK,BST_UNCHECKED,0);set(Width,L"500");check(value(Height)==L"160","unlocked dimensions can be edited independently");
+    SendMessageW(controls[LockRatio],BM_SETCHECK,BST_CHECKED,0);set(Width,L"7680");Settings oversized;check(value(Height)==std::to_wstring(pairedDimension(7680,1136,640))&&!collect(oversized,false),"locked ratio exceeding supported bounds is rejected");set(Width,L"568");
     detailsOpen=true;panelSize();check((GetWindowLongPtrW(listWindow,GWL_STYLE)&WS_VISIBLE)!=0,"optional window selection expands");detailsOpen=false;panelSize();check(!(GetWindowLongPtrW(listWindow,GWL_STYLE)&WS_VISIBLE),"window list collapses again");check(addTray(),"system tray icon registration");DestroyWindow(panel);check(!trayReady,"tray icon removed on program exit");
     printf("RESULT %d/%d passed\n",count-failed,count);return failed==0;
 }
