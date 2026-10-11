@@ -1,4 +1,4 @@
-// 鼠卫兵 0.3.1 — native Win32, no background service or game injection.
+// 鼠卫兵 0.3.2 — native Win32, no background service or game injection.
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -595,7 +595,7 @@ static void layout(){
 static void panelSize(){RECT r{0,0,px(580),px(detailsOpen?650:410)};AdjustWindowRectEx(&r,(DWORD)GetWindowLongPtrW(mainWindow,GWL_STYLE),FALSE,0);SetWindowPos(mainWindow,nullptr,0,0,r.right-r.left,r.bottom-r.top,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);layout();InvalidateRect(mainWindow,nullptr,TRUE);}
 static void createUi(){
     sizingFields=true;ratioWidth=1113;ratioHeight=627;
-    fonts();auto icon=control(Icon,L"STATIC",L"",SS_ICON|SS_CENTERIMAGE);SendMessageW(icon,STM_SETICON,(WPARAM)LoadImageW(instance,MAKEINTRESOURCEW(101),IMAGE_ICON,px(46),px(46),LR_DEFAULTCOLOR),0);label(Header,L"鼠卫兵");SendMessageW(controls[Header],WM_SETFONT,(WPARAM)titleFont,TRUE);label(Subtitle,L"阴阳师窗口管家 · 0.3.1");button(Background,L"后台");button(Details,L"窗口 / 设置");button(Help,L"说明");
+    fonts();auto icon=control(Icon,L"STATIC",L"",SS_ICON|SS_CENTERIMAGE);SendMessageW(icon,STM_SETICON,(WPARAM)LoadImageW(instance,MAKEINTRESOURCEW(101),IMAGE_ICON,px(46),px(46),LR_DEFAULTCOLOR),0);label(Header,L"鼠卫兵");SendMessageW(controls[Header],WM_SETFONT,(WPARAM)titleFont,TRUE);label(Subtitle,L"阴阳师窗口管家 · 0.3.2");button(Background,L"后台");button(Details,L"窗口 / 设置");button(Help,L"说明");
     label(LPath,L"游戏");edit(Path,cfg.path);button(AutoFind,L"查找 ▾");button(Browse,L"选择");label(LArgs,L"参数");edit(Args,cfg.args);
     label(LCount,L"数量");edit(Count,std::to_wstring(cfg.count),true);label(LDelay,L"间隔 / ms");edit(Delay,std::to_wstring(cfg.delay),true);button(Launch,L"启动 / 多开");button(Cancel,L"停止");EnableWindow(controls[Cancel],FALSE);
     label(LFilter,L"进程");edit(Filter,cfg.filter);button(Refresh,L"刷新");button(Pick,L"添加窗口（3 秒）");
@@ -663,7 +663,7 @@ static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
     case WM_DESTROY:delete pendingScan;pendingScan=nullptr;if(bossRegistered)UnregisterHotKey(w,bossRegistration);bossRegistered=false;if(trayReady)Shell_NotifyIconW(NIM_DELETE,&tray);trayReady=false;PostQuitMessage(0);return 0;
     }return DefWindowProcW(w,msg,wp,lp);
 }
-static bool selfTest(const S& dir){
+static bool selfTest(const S& dir,bool ciMode=false){
     CreateDirectoryW(dir.c_str(),nullptr);int failed=0,count=0;auto check=[&](bool ok,const char* name){count++;printf("%s %s\n",ok?"PASS":"FAIL",name);if(!ok)failed++;};
     Settings a;a.path=L"C:\\游戏目录\\Launch.exe";a.args=L"--name \"中文账户\"";auto b=encode(a);Settings c;
     check(decode(b,c)&&c.path==a.path&&c.args==a.args&&c.width==1113&&c.height==627,"unicode settings round trip");
@@ -809,7 +809,11 @@ static bool selfTest(const S& dir){
     addGamePath(fromBin,game+L"\\LAUNCH.EXE");addGamePath(fromBin,game+L"\\missing.exe");check(fromBin.size()==1,"directory candidates deduplicate case and ignore missing executables");
     check(scanGameFolder(scanRoot+L"\\missing").paths.empty(),"missing scan folder returns no candidates");
     check(S(OfficialDownload)==L"https://yys.163.com/zmb/","official download uses user supplied URL");
-    detailsOpen=true;panelSize();check((GetWindowLongPtrW(listWindow,GWL_STYLE)&WS_VISIBLE)&&(GetWindowLongPtrW(controls[BossKey],GWL_STYLE)&WS_VISIBLE),"window selection and boss key settings expand");detailsOpen=false;panelSize();check(!(GetWindowLongPtrW(listWindow,GWL_STYLE)&WS_VISIBLE)&&!(GetWindowLongPtrW(controls[BossKey],GWL_STYLE)&WS_VISIBLE),"window list and boss settings collapse again");check(addTray(),"system tray icon registration");registerBoss(true,testKey,testMods,false);DestroyWindow(panel);check(!trayReady&&!bossRegistered,"tray and boss key removed on program exit");
+    detailsOpen=true;panelSize();check((GetWindowLongPtrW(listWindow,GWL_STYLE)&WS_VISIBLE)&&(GetWindowLongPtrW(controls[BossKey],GWL_STYLE)&WS_VISIBLE),"window selection and boss key settings expand");detailsOpen=false;panelSize();check(!(GetWindowLongPtrW(listWindow,GWL_STYLE)&WS_VISIBLE)&&!(GetWindowLongPtrW(controls[BossKey],GWL_STYLE)&WS_VISIBLE),"window list and boss settings collapse again");
+    // Hosted runners may lack Explorer; keep the full tray check on desktops.
+    if(ciMode&&!FindWindowW(L"Shell_TrayWnd",nullptr))printf("SKIP system tray icon registration: no Explorer shell in CI\n");
+    else check(addTray(),"system tray icon registration");
+    registerBoss(true,testKey,testMods,false);DestroyWindow(panel);check(!trayReady&&!bossRegistered,"tray and boss key removed on program exit");
     printf("RESULT %d/%d passed\n",count-failed,count);return failed==0;
 }
 static S geometryReport(const Target& t){
@@ -829,11 +833,12 @@ static S geometryReport(const Target& t){
 }
 int WINAPI wWinMain(HINSTANCE h,HINSTANCE,LPWSTR,int show){
     instance=h;int argc=0;LPWSTR* argv=CommandLineToArgvW(GetCommandLineW(),&argc);
-    bool diagnostics=false,discoverReport=false;int waitParent=0;
+    bool diagnostics=false,discoverReport=false,ciMode=false;int waitParent=0;
     for(int i=1;i<argc;i++){if(S(argv[i])==L"--self-test")testMode=true;if(S(argv[i])==L"--smoke-test")smokeMode=true;if(S(argv[i])==L"--diagnose")diagnostics=true;if(S(argv[i])==L"--discover")discoverReport=true;if(S(argv[i])==L"--wait-parent"&&i+1<argc)number(argv[++i],1,99999999,waitParent);}
     if(discoverReport&&argc>2){S output=L"\uFEFF鼠卫兵自动读取客户端路径与多开入口\r\n";for(auto& path:gameCandidates()){output+=path+L"\r\n";LaunchSpec plan;S error;if(resolveLaunch(path,L"",plan,error))output+=L"  实际启动="+plan.executable+L"\r\n  工作目录="+plan.directory+L"\r\n";else output+=L"  无法追加多开="+error+L"\r\n";}bool ok=atomicWrite(argv[argc-1],output.data(),output.size()*2);LocalFree(argv);return ok?0:1;}
     if(diagnostics&&argc>2){EnumWindows(enumTarget,(LPARAM)&cfg.filter);S report=L"\uFEFF鼠卫兵窗口识别诊断\r\n筛选："+cfg.filter+L"\r\n窗口数量："+std::to_wstring(targets.size())+L"\r\n";for(auto& t:targets)report+=L"PID="+std::to_wstring(t.pid)+L" | "+t.process+L" | "+t.title+L" | 身份有效="+(valid(t)?L"是":L"否")+L"\r\n"+geometryReport(t);bool ok=atomicWrite(argv[argc-1],report.data(),report.size()*sizeof(wchar_t));LocalFree(argv);return ok?0:1;}
-    if(testMode){S dir=argc>2?argv[argc-1]:L".";CreateDirectoryW(dir.c_str(),nullptr);FILE* file;_wfreopen_s(&file,(dir+L"\\test-results.txt").c_str(),L"w",stdout);bool ok=selfTest(dir);fflush(stdout);LocalFree(argv);return ok?0:1;}
+    for(int i=1;i<argc;i++)if(S(argv[i])==L"--ci")ciMode=true;
+    if(testMode){S dir=argc>2?argv[argc-1]:L".";CreateDirectoryW(dir.c_str(),nullptr);FILE* file;_wfreopen_s(&file,(dir+L"\\test-results.txt").c_str(),L"w",stdout);bool ok=selfTest(dir,ciMode);fflush(stdout);LocalFree(argv);return ok?0:1;}
     LocalFree(argv);
     if(waitParent){HANDLE parent=OpenProcess(SYNCHRONIZE,FALSE,waitParent);if(parent){DWORD result=WaitForSingleObject(parent,10000);CloseHandle(parent);if(result!=WAIT_OBJECT_0){MessageBoxW(nullptr,L"原窗口尚未退出，请退出原鼠卫兵后再以管理员身份运行。",L"鼠卫兵",MB_OK|MB_ICONINFORMATION);return 1;}}}
     elevated=isElevated();
