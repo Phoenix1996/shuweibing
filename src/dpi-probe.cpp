@@ -8,15 +8,18 @@
 #include <cstdio>
 #include <string>
 static LRESULT CALLBACK holdProc(HWND w,UINT message,WPARAM wp,LPARAM lp){
+    if(message==WM_CLOSE&&GetPropW(w,L"ShuWeiBing.CloseFixture")){if(MessageBoxW(w,L"确定要离开吗?",L"退出游戏",MB_OKCANCEL|MB_ICONERROR)==IDOK)DestroyWindow(w);return 0;}
     if(message==WM_TIMER){if(wp==2){KillTimer(w,2);RECT r{0,0,640,360};AdjustWindowRectEx(&r,WS_OVERLAPPEDWINDOW,FALSE,0);SetWindowPos(w,nullptr,0,0,r.right-r.left,r.bottom-r.top,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);}else DestroyWindow(w);return 0;}if(message==WM_DESTROY){PostQuitMessage(0);return 0;}return DefWindowProcW(w,message,wp,lp);
 }
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
     int argc=0;auto argv=CommandLineToArgvW(GetCommandLineW(),&argc);
-    if(argc==3&&(std::wstring(argv[1])==L"--hold"||std::wstring(argv[1])==L"--startup-fixture")){
+    if(argc==3&&(std::wstring(argv[1])==L"--hold"||std::wstring(argv[1])==L"--startup-fixture"||std::wstring(argv[1])==L"--close-fixture")){
         bool startup=std::wstring(argv[1])==L"--startup-fixture";
+        bool closeFixture=std::wstring(argv[1])==L"--close-fixture";
         WNDCLASSW wc{};wc.lpfnWndProc=holdProc;wc.hInstance=instance;wc.lpszClassName=L"ShuWeiBing.LaunchTest";RegisterClassW(&wc);
         HWND window=CreateWindowExW(0,wc.lpszClassName,L"鼠卫兵多开测试窗口",WS_OVERLAPPEDWINDOW,0,0,320,240,nullptr,nullptr,instance,nullptr);
         if(!window){LocalFree(argv);return 1;}
+        if(closeFixture){SetPropW(window,L"ShuWeiBing.CloseFixture",(HANDLE)1);ShowWindow(window,SW_SHOWNOACTIVATE);}
         wchar_t directory[32768]{};GetCurrentDirectoryW(32768,directory);
         std::wstring record=L"\uFEFF"+std::to_wstring((uintptr_t)window)+L"\n"+directory;
         HANDLE file=CreateFileW(argv[2],GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);LocalFree(argv);

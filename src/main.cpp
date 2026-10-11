@@ -71,6 +71,9 @@ static std::vector<StartupWindow> startupWindows;
 static ULONGLONG startupDeadline=0;
 static bool updateBusy=false;
 static updates::Result* pendingUpdate=nullptr;
+static std::vector<Target> closingWindows;
+static std::set<HWND> confirmedDialogs;
+static ULONGLONG closeDeadline=0;
 static std::map<int,HWND> controls;
 enum {
     Path=100, Browse, Args, Count, Delay, Launch, Cancel, Filter, Refresh,
@@ -350,14 +353,43 @@ static int sendCloseRequests(const std::vector<Target>& rows,bool confirmed){
     for(auto& t:rows)if(t.hwnd!=mainWindow&&valid(t)){if(!IsWindowVisible(t.hwnd))ShowWindowAsync(t.hwnd,SW_SHOW);if(PostMessageW(t.hwnd,WM_CLOSE,0,0))count++;}
     return count;
 }
+static S boundedControlText(HWND w){
+    wchar_t buffer[256]{};DWORD_PTR result=0;
+    if(!SendMessageTimeoutW(w,WM_GETTEXT,256,(LPARAM)buffer,SMTO_ABORTIFHUNG|SMTO_BLOCK,100,&result))return {};
+    return buffer;
+}
+static BOOL CALLBACK findExitPrompt(HWND child,LPARAM context){
+    wchar_t kind[32]{};GetClassNameW(child,kind,32);if(S(kind)!=L"Static")return TRUE;
+    S value=boundedControlText(child);if(value==L"确定要离开吗?"||value==L"确定要离开吗？")*(bool*)context=true;return TRUE;
+}
+static HWND exitConfirmButton(HWND dialog,const Target& game){
+    if(!valid(game)||!IsWindowVisible(dialog))return nullptr;
+    DWORD pid=0;GetWindowThreadProcessId(dialog,&pid);if(pid!=game.pid)return nullptr;
+    wchar_t kind[32]{};GetClassNameW(dialog,kind,32);if(S(kind)!=L"#32770"||text(dialog)!=L"退出游戏")return nullptr;
+    HWND owner=GetWindow(dialog,GW_OWNER);int depth=0;while(owner&&owner!=game.hwnd&&depth++<16)owner=GetWindow(owner,GW_OWNER);if(owner!=game.hwnd)return nullptr;
+    bool prompt=false;EnumChildWindows(dialog,findExitPrompt,(LPARAM)&prompt);if(!prompt)return nullptr;
+    HWND button=GetDlgItem(dialog,IDOK);if(!button||!IsWindowVisible(button)||!IsWindowEnabled(button))return nullptr;
+    GetClassNameW(button,kind,32);S label=boundedControlText(button);if(S(kind)!=L"Button"||(label!=L"确定"&&label!=L"确定(&O)"&&label!=L"&确定"))return nullptr;
+    // Recheck the original game's PID and creation time immediately before use.
+    return valid(game)?button:nullptr;
+}
+static BOOL CALLBACK confirmExitDialog(HWND dialog,LPARAM context){
+    auto rows=(const std::vector<Target>*)context;if(confirmedDialogs.count(dialog))return TRUE;
+    for(auto& game:*rows)if(HWND button=exitConfirmButton(dialog,game)){if(PostMessageW(button,BM_CLICK,0,0))confirmedDialogs.insert(dialog);break;}return TRUE;
+}
+static void closeTick(){
+    bool any=false;for(auto& game:closingWindows)if(valid(game))any=true;
+    if(!any||GetTickCount64()>closeDeadline){KillTimer(mainWindow,7);closingWindows.clear();confirmedDialogs.clear();EnableWindow(controls[CloseAll],TRUE);refresh();status(any?L"部分窗口尚未退出；无法识别的确认框请手动处理。":L"批量关闭完成。");return;}
+    EnumWindows(confirmExitDialog,(LPARAM)&closingWindows);
+}
 static void stopStartup(){KillTimer(mainWindow,1);KillTimer(mainWindow,6);launchRemaining=0;startupWindows.clear();EnableWindow(controls[Launch],TRUE);EnableWindow(controls[Cancel],FALSE);}
 static void closeAllGames(){
     refresh();auto rows=targets;if(rows.empty()){status(L"没有可关闭的游戏窗口。");return;}
-    S message=L"确认关闭列表中的全部 "+std::to_wstring(rows.size())+L" 个游戏窗口？包括未勾选和已隐藏的窗口。\n未保存进度可能丢失；正在等待的启动也会取消。\n\n";
+    S message=L"确认关闭列表中的全部 "+std::to_wstring(rows.size())+L" 个游戏窗口？包括未勾选和已隐藏的窗口。\n鼠卫兵会自动确认这些窗口的“退出游戏 / 确定要离开吗？”提示。\n未保存进度可能丢失；正在等待的启动也会取消。\n\n";
     for(size_t i=0;i<rows.size()&&i<8;i++)message+=rows[i].title+L"（"+rows[i].process+L"）\n";
     if(MessageBoxW(mainWindow,message.c_str(),L"鼠卫兵 · 批量关闭游戏",MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2)!=IDYES)return;
     stopArrangement();stopStartup();
-    int count=sendCloseRequests(rows,true);status(L"已向 "+std::to_wstring(count)+L" / "+std::to_wstring(rows.size())+L" 个窗口发送关闭请求；游戏内确认仍需处理。");SetTimer(mainWindow,3,1500,nullptr);
+    int count=sendCloseRequests(rows,true);closingWindows=rows;confirmedDialogs.clear();closeDeadline=GetTickCount64()+8000;EnableWindow(controls[CloseAll],FALSE);SetTimer(mainWindow,7,250,nullptr);status(L"已发送 "+std::to_wstring(count)+L" / "+std::to_wstring(rows.size())+L" 个关闭请求，正在确认游戏退出…");
 }
 static S sharpCompatibility(const S& previous){
     S result;size_t at=0;
@@ -733,6 +765,7 @@ static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
         case 4:arrangementTick();break;
         case 5:bossFinishTick();break;
         case 6:startupTick();break;
+        case 7:closeTick();break;
         case 9:KillTimer(w,9);DestroyWindow(w);break;
         }return 0;
     case WM_CLOSE:stopArrangement();persist();restoreHidden();DestroyWindow(w);return 0;
