@@ -6,7 +6,7 @@ $exe=Join-Path $stage '鼠卫兵.exe'
 if(!(Test-Path -LiteralPath $exe)){throw '请先运行 build.ps1'}
 $info=(Get-Item -LiteralPath $exe).VersionInfo
 if($info.ProductVersion -ne $version -or $info.CompanyName -ne 'Phoenix Feng'){throw '版本或作者署名不匹配'}
-foreach($name in @('README.md','LICENSE','NOTICE.md','CHANGELOG.md')){
+foreach($name in @('README.md','LICENSE','NOTICE.md','CHANGELOG.md','验证记录.md')){
     Copy-Item -LiteralPath (Join-Path $root $name) -Destination $stage -Force
 }
 $assets=Join-Path $stage 'assets'
@@ -22,7 +22,7 @@ New-Item -ItemType Directory $output -Force | Out-Null
 $zipName="鼠卫兵-$version-windows-x64.zip"
 $zip=Join-Path $output $zipName
 # Explicit allowlist excludes obsolete files, settings and test fixtures from the ZIP.
-$inputs=@('鼠卫兵.exe','README.md','LICENSE','NOTICE.md','CHANGELOG.md','SHA256SUMS.txt','assets') | ForEach-Object {Join-Path $stage $_}
+$inputs=@('鼠卫兵.exe','README.md','LICENSE','NOTICE.md','CHANGELOG.md','验证记录.md','SHA256SUMS.txt','assets') | ForEach-Object {Join-Path $stage $_}
 Compress-Archive -LiteralPath $inputs -DestinationPath $zip -Force
 $zipHash=(Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
 [System.IO.File]::WriteAllText((Join-Path $output 'SHA256SUMS.txt'),"$zipHash  $zipName`n",$utf8)
