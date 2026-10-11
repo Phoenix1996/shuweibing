@@ -1,4 +1,4 @@
-// 鼠卫兵 0.2.1 — native Win32, no background service or game injection.
+// 鼠卫兵 0.3 — native Win32, no background service or game injection.
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -26,7 +26,8 @@ using S = std::wstring;
 struct Settings {
     S path, args, filter=L"onmyoji;YysLauncher";
     int width=1113, height=627, count=2, delay=1200, columns=0, opacity=100;
-    bool lockRatio=true, sharpLaunch=true;
+    bool lockRatio=true, sharpLaunch=true, bossEnabled=true;
+    int bossKey='H', bossMods=MOD_CONTROL|MOD_ALT;
 };
 struct Target {
     HWND hwnd{}; DWORD pid{}; uint64_t born{}; S title, process;
@@ -49,6 +50,9 @@ static int ratioWidth=1113, ratioHeight=627;
 static const UINT TrayMessage=WM_APP+1;
 static UINT taskbarCreated;
 static NOTIFYICONDATAW tray{};
+static bool elevated=false, bossRegistered=false, bossActive=false, bossPanelVisible=false, bossBusy=false;
+static int bossRegistration=3010, registeredKey=0, registeredMods=0, bossTicks=0;
+static std::map<HWND,Target> bossHidden;
 static Settings cfg;
 static S configDir, configPath;
 static bool loadingList=false, testMode=false, smokeMode=false;
@@ -66,7 +70,8 @@ enum {
     Pick, SelectAll, SelectNone, Width, Height, Resize, Columns, Screen, Arrange,
     Opacity, Alpha, Hide, Show, Restore, Help, List, Header, Subtitle,
     LPath, LArgs, LCount, LDelay, LFilter, LWidth, LHeight, LColumns, LScreen,
-    LOpacity, LWindows, Hint, Icon, Details, LockRatio, Background, SharpLaunch
+    LOpacity, LWindows, Hint, Icon, Details, LockRatio, Background, SharpLaunch,
+    Admin, LBoss, BossEnabled, BossKey, BossSave, BossDisable, AutoFind
 };
 static int px(int n){return MulDiv(n,dpi,96);}
 static S text(HWND w){int n=GetWindowTextLengthW(w); S s(n+1,L'\0');GetWindowTextW(w,s.data(),n+1);s.resize(n);return s;}
@@ -105,6 +110,7 @@ static std::vector<unsigned char> encode(const Settings& c){
     s+=L"\ndelay="+std::to_wstring(c.delay)+L"\ncolumns="+std::to_wstring(c.columns)+L"\nopacity="+std::to_wstring(c.opacity)+L"\n";
     s+=L"lockRatio="+S(c.lockRatio?L"1":L"0")+L"\n";
     s+=L"sharpLaunch="+S(c.sharpLaunch?L"1":L"0")+L"\n";
+    s+=L"bossEnabled="+S(c.bossEnabled?L"1":L"0")+L"\nbossKey="+std::to_wstring(c.bossKey)+L"\nbossMods="+std::to_wstring(c.bossMods)+L"\n";
     uint64_t check=hash(s.data(),s.size()*sizeof(wchar_t));
     std::vector<unsigned char> b(8+s.size()*sizeof(wchar_t));memcpy(b.data(),&check,8);memcpy(b.data()+8,s.data(),s.size()*sizeof(wchar_t));return b;
 }
@@ -116,13 +122,16 @@ static bool decode(const std::vector<unsigned char>& b,Settings& c){
     std::map<S,S> kv;size_t at=magic.size();
     while(at<s.size()){size_t end=s.find(L'\n',at);if(end==S::npos)return false;size_t eq=s.find(L'=',at);if(eq==S::npos||eq>=end)return false;S key=s.substr(at,eq-at);if(kv.count(key))return false;kv[key]=s.substr(eq+1,end-eq-1);at=end+1;}
     Settings candidate;
-    if(kv.size()<9||kv.size()>11||!kv.count(L"path")||!kv.count(L"args")||!kv.count(L"filter"))return false;
-    for(auto& [key,value]:kv)if(key!=L"path"&&key!=L"args"&&key!=L"filter"&&key!=L"width"&&key!=L"height"&&key!=L"count"&&key!=L"delay"&&key!=L"columns"&&key!=L"opacity"&&key!=L"lockRatio"&&key!=L"sharpLaunch")return false;
+    if(kv.size()<9||kv.size()>14||!kv.count(L"path")||!kv.count(L"args")||!kv.count(L"filter"))return false;
+    for(auto& [key,value]:kv)if(key!=L"path"&&key!=L"args"&&key!=L"filter"&&key!=L"width"&&key!=L"height"&&key!=L"count"&&key!=L"delay"&&key!=L"columns"&&key!=L"opacity"&&key!=L"lockRatio"&&key!=L"sharpLaunch"&&key!=L"bossEnabled"&&key!=L"bossKey"&&key!=L"bossMods")return false;
     candidate.path=kv[L"path"];candidate.args=kv[L"args"];candidate.filter=kv[L"filter"];
     if(candidate.path.size()>32000||candidate.args.size()>4096||candidate.filter.empty()||candidate.filter.size()>256)return false;
     if(!number(kv[L"width"],160,7680,candidate.width)||!number(kv[L"height"],120,4320,candidate.height)||!number(kv[L"count"],1,20,candidate.count)||!number(kv[L"delay"],500,10000,candidate.delay)||!number(kv[L"columns"],0,20,candidate.columns)||!number(kv[L"opacity"],20,100,candidate.opacity))return false;
     if(kv.count(L"lockRatio")){int lock;if(!number(kv[L"lockRatio"],0,1,lock))return false;candidate.lockRatio=lock!=0;}
     if(kv.count(L"sharpLaunch")){int sharp;if(!number(kv[L"sharpLaunch"],0,1,sharp))return false;candidate.sharpLaunch=sharp!=0;}
+    if(kv.count(L"bossEnabled")||kv.count(L"bossKey")||kv.count(L"bossMods")){
+        int enabled;if(!number(kv[L"bossEnabled"],0,1,enabled)||!number(kv[L"bossKey"],1,254,candidate.bossKey)||!number(kv[L"bossMods"],0,7,candidate.bossMods))return false;candidate.bossEnabled=enabled!=0;
+    }
     c=candidate;return true;
 }
 static bool loadSettings(const S& p,Settings& c,int& source){
@@ -335,6 +344,89 @@ static std::vector<wchar_t> launchEnvironment(bool sharp){
     std::sort(entries.begin(),entries.end(),[](const S& a,const S& b){return CompareStringOrdinal(a.c_str(),-1,b.c_str(),-1,TRUE)==CSTR_LESS_THAN;});
     std::vector<wchar_t> block;for(auto& entry:entries){block.insert(block.end(),entry.begin(),entry.end());block.push_back(0);}block.push_back(0);if(block.size()==1)block.push_back(0);return block;
 }
+static bool validBossKey(int key,int mods){
+    return key>0&&key<255&&key!=VK_SHIFT&&key!=VK_CONTROL&&key!=VK_MENU&&key!=VK_LWIN&&key!=VK_RWIN&&key!=VK_F12&&(mods&~7)==0&&((mods&(MOD_CONTROL|MOD_ALT))||(key>=VK_F1&&key<=VK_F11));
+}
+static WORD hotkeyControlValue(int key,int mods){
+    BYTE flags=(mods&MOD_CONTROL?HOTKEYF_CONTROL:0)|(mods&MOD_ALT?HOTKEYF_ALT:0)|(mods&MOD_SHIFT?HOTKEYF_SHIFT:0);
+    if((MapVirtualKeyW(key,MAPVK_VK_TO_VSC_EX)&0xff00)==0xe000)flags|=HOTKEYF_EXT;
+    return MAKEWORD(key,flags);
+}
+static int hotkeyModifiers(WORD value){
+    auto flags=HIBYTE(value);return (flags&HOTKEYF_CONTROL?MOD_CONTROL:0)|(flags&HOTKEYF_ALT?MOD_ALT:0)|(flags&HOTKEYF_SHIFT?MOD_SHIFT:0);
+}
+static S hotkeyName(int key,int mods){
+    S name;if(mods&MOD_CONTROL)name+=L"Ctrl + ";if(mods&MOD_ALT)name+=L"Alt + ";if(mods&MOD_SHIFT)name+=L"Shift + ";
+    UINT scan=MapVirtualKeyW(key,MAPVK_VK_TO_VSC_EX);LONG bits=(scan&0xff)<<16;if(scan&0xff00)bits|=1<<24;wchar_t label[80]{};
+    if(GetKeyNameTextW(bits,label,80))name+=label;else name+=L"键 "+std::to_wstring(key);return name;
+}
+static bool registerBoss(bool enable,int key,int mods,bool notify=true){
+    if(!enable){if(bossRegistered)UnregisterHotKey(mainWindow,bossRegistration);bossRegistered=false;return true;}
+    if(!validBossKey(key,mods)){if(notify)status(L"请选择 Ctrl/Alt 组合键或 F1–F11；F12 为系统保留键。");return false;}
+    if(bossRegistered&&registeredKey==key&&registeredMods==mods)return true;
+    int next=bossRegistration==3010?3011:3010;
+    if(!RegisterHotKey(mainWindow,next,mods|MOD_NOREPEAT,key)){if(notify)status(L"老板键已被其他程序占用或系统保留，请换一个组合；原快捷键继续有效。");return false;}
+    if(bossRegistered)UnregisterHotKey(mainWindow,bossRegistration);
+    bossRegistration=next;bossRegistered=true;registeredKey=key;registeredMods=mods;return true;
+}
+static void saveBossKey(bool disable=false){
+    Settings candidate;if(!collect(candidate))return;WORD chosen=(WORD)SendMessageW(controls[BossKey],HKM_GETHOTKEY,0,0);
+    candidate.bossEnabled=!disable&&SendMessageW(controls[BossEnabled],BM_GETCHECK,0,0)==BST_CHECKED;
+    if(candidate.bossEnabled){candidate.bossKey=LOBYTE(chosen);candidate.bossMods=hotkeyModifiers(chosen);}
+    if(!registerBoss(candidate.bossEnabled,candidate.bossKey,candidate.bossMods))return;
+    if(!saveSettings(configPath,candidate)){registerBoss(cfg.bossEnabled,cfg.bossKey,cfg.bossMods,false);status(L"老板键保存失败，已恢复原设置。");return;}
+    cfg=candidate;SendMessageW(controls[BossEnabled],BM_SETCHECK,cfg.bossEnabled?BST_CHECKED:BST_UNCHECKED,0);
+    status(cfg.bossEnabled?L"老板键已保存："+hotkeyName(cfg.bossKey,cfg.bossMods)+L" · 按一次隐藏，再按恢复。":L"老板键已停用；已隐藏的窗口仍可点击“显示”恢复。");
+}
+static void bossFinishTick(){
+    bool settled=true;
+    for(auto it=bossHidden.begin();it!=bossHidden.end();){
+        if(!valid(it->second)){it=bossHidden.erase(it);continue;}
+        bool visible=IsWindowVisible(it->first)!=0;
+        if(!bossActive&&visible){hidden.erase(it->first);it=bossHidden.erase(it);continue;}
+        if(bossActive?visible:!visible)settled=false;
+        ++it;
+    }
+    if(!settled&&++bossTicks<10)return;
+    KillTimer(mainWindow,5);bossBusy=false;
+    if(!bossActive&&!bossHidden.empty())bossActive=true;
+    saveHidden();refresh();
+    if(!settled){if(bossPanelVisible){ShowWindow(mainWindow,SW_RESTORE);SetForegroundWindow(mainWindow);}status(L"部分窗口没有响应老板键；可重试，若游戏以管理员运行，请点击“管理员启动”。");}
+}
+static void toggleBossRows(const std::vector<Target>& rows){
+    if(bossBusy)return;stopArrangement();
+    if(bossActive){
+        for(auto& [hwnd,t]:bossHidden)if(valid(t))ShowWindowAsync(hwnd,SW_SHOWNA);
+        bossActive=false;if(bossPanelVisible){ShowWindow(mainWindow,SW_RESTORE);SetForegroundWindow(mainWindow);}status(L"老板键 · 已发送恢复请求。");
+    }else{
+        std::map<HWND,Target> batch;for(auto& t:rows)if(valid(t)&&IsWindowVisible(t.hwnd))batch[t.hwnd]=t;
+        if(batch.empty()){status(L"老板键：没有选中的可见游戏窗口。");return;}
+        auto previous=hidden;for(auto& [hwnd,t]:batch)hidden[hwnd]=t;
+        if(!saveHidden()){hidden=previous;status(L"无法保存恢复记录，已取消老板键隐藏。");return;}
+        bossHidden.clear();for(auto& [hwnd,t]:batch){if(ShowWindowAsync(hwnd,SW_HIDE))bossHidden[hwnd]=t;else if(!previous.count(hwnd))hidden.erase(hwnd);}
+        if(bossHidden.empty()){saveHidden();status(L"窗口隐藏失败，请检查管理员权限。");return;}
+        bossActive=true;bossPanelVisible=IsWindowVisible(mainWindow)!=0&&!IsIconic(mainWindow);
+        if(bossPanelVisible)ShowWindow(mainWindow,trayReady?SW_HIDE:SW_MINIMIZE);
+        status(L"老板键 · 已发送隐藏请求，再按恢复。");
+    }
+    bossBusy=true;bossTicks=0;SetTimer(mainWindow,5,150,nullptr);
+}
+static void toggleBoss(){if(bossActive)toggleBossRows({});else{refresh();toggleBossRows(selected());}}
+static bool isElevated(){
+    HANDLE token{};if(!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token))return false;
+    TOKEN_ELEVATION info{};DWORD bytes{};bool result=GetTokenInformation(token,TokenElevation,&info,sizeof(info),&bytes)&&info.TokenIsElevated;CloseHandle(token);return result;
+}
+static S adminHint(bool admin){return admin?L"已以系统管理员身份运行":L"普通权限 · 建议以系统管理员身份运行";}
+static void restartAdmin(){
+    if(elevated){status(L"当前已以系统管理员身份运行。");return;}
+    Settings next;if(!collect(next))return;
+    if(!saveSettings(configPath,next)){status(L"设置保存失败，请稍后重试管理员启动。");return;}cfg=next;
+    wchar_t executable[32768]{};if(!GetModuleFileNameW(nullptr,executable,32768))return;
+    S parameters=L"--wait-parent "+std::to_wstring(GetCurrentProcessId()),directory=folderOf(executable);
+    SHELLEXECUTEINFOW request{sizeof(request)};request.fMask=SEE_MASK_NOCLOSEPROCESS;request.hwnd=mainWindow;request.lpVerb=L"runas";request.lpFile=executable;request.lpParameters=parameters.c_str();request.lpDirectory=directory.c_str();request.nShow=SW_SHOWNORMAL;
+    if(!ShellExecuteExW(&request)){DWORD error=GetLastError();status(error==ERROR_CANCELLED?L"已取消管理员启动，当前程序继续运行。":L"管理员启动失败。"+winError(error));return;}
+    if(request.hProcess)CloseHandle(request.hProcess);SendMessageW(mainWindow,WM_CLOSE,0,0);
+}
 static void launchOne(){
     if(launchRemaining<=0)return;
     S command=L"\""+launchPath+L"\""+(launchArgs.empty()?L"":L" "+launchArgs);std::vector<wchar_t> buffer(command.begin(),command.end());buffer.push_back(0);
@@ -354,17 +446,87 @@ static void beginLaunch(){
     cfg=c;persist();launchPath=c.path;launchArgs=c.args;launchRemaining=launchTotal=c.count;EnableWindow(controls[Launch],FALSE);EnableWindow(controls[Cancel],TRUE);SetTimer(mainWindow,1,c.delay,nullptr);launchOne();
 }
 static void browse(){wchar_t path[32768]{};OPENFILENAMEW o{};o.lStructSize=sizeof(o);o.hwndOwner=mainWindow;o.lpstrFilter=L"游戏或启动器 (*.exe)\0*.exe\0\0";o.lpstrFile=path;o.nMaxFile=32768;o.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;if(GetOpenFileNameW(&o)){set(Path,path);persist();}}
-static S detectGame(){
-    if(fileExists(L"K:\\Netease\\yys\\launch.exe"))return L"K:\\Netease\\yys\\launch.exe";
+static const wchar_t* OfficialDownload=L"https://yys.163.com/zmb/";
+static void addGamePath(std::vector<S>& paths,const S& path){
+    if(paths.size()>=32||!fileExists(path))return;
+    for(auto& previous:paths)if(lower(previous)==lower(path))return;paths.push_back(path);
+}
+static void launchersIn(std::vector<S>& paths,S folder){
+    while(!folder.empty()&&(folder.back()==L'\\'||folder.back()==L'/'))folder.pop_back();
+    for(auto exe:{L"\\launch.exe",L"\\YysLauncher.exe"})addGamePath(paths,folder+exe);
+    if(lower(folder.substr(folder.find_last_of(L"\\/")+1))==L"bin")for(auto exe:{L"\\launch.exe",L"\\YysLauncher.exe"})addGamePath(paths,folderOf(folder)+exe);
+}
+struct RunningDiscovery {std::vector<S> paths;std::set<DWORD> checked;};
+static BOOL CALLBACK discoverRunning(HWND window,LPARAM data){
+    if(!GetWindowTextLengthW(window))return TRUE;auto& found=*(RunningDiscovery*)data;DWORD pid{};GetWindowThreadProcessId(window,&pid);if(!found.checked.insert(pid).second)return TRUE;
+    HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);if(!process)return TRUE;
+    wchar_t path[32768]{};DWORD n=32768;if(QueryFullProcessImageNameW(process,0,path,&n)){
+        S image(path,n),name=lower(image.substr(image.find_last_of(L"\\/")+1));
+        if(name==L"onmyoji.exe"||name==L"yyslauncher.exe")launchersIn(found.paths,folderOf(image));
+    }CloseHandle(process);return TRUE;
+}
+static std::vector<S> gameCandidates(){
+    RunningDiscovery running;EnumWindows(discoverRunning,(LPARAM)&running);auto paths=running.paths;
+    addGamePath(paths,cfg.path);addGamePath(paths,L"K:\\Netease\\yys\\launch.exe");
     for(auto root:{HKEY_LOCAL_MACHINE,HKEY_CURRENT_USER})for(auto view:{KEY_WOW64_32KEY,KEY_WOW64_64KEY}){
         HKEY h;if(RegOpenKeyExW(root,L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",0,KEY_READ|view,&h)!=ERROR_SUCCESS)continue;
         for(DWORD i=0;;i++){wchar_t name[512];DWORD n=512;if(RegEnumKeyExW(h,i,name,&n,nullptr,nullptr,nullptr,nullptr)!=ERROR_SUCCESS)break;HKEY sub;
             if(RegOpenKeyExW(h,name,0,KEY_READ|view,&sub)!=ERROR_SUCCESS)continue;
             wchar_t display[2048]{},location[32768]{};DWORD bytes=sizeof(display);RegQueryValueExW(sub,L"DisplayName",nullptr,nullptr,(BYTE*)display,&bytes);
-            if(S(display).find(L"阴阳师")!=S::npos){bytes=sizeof(location);if(RegQueryValueExW(sub,L"InstallLocation",nullptr,nullptr,(BYTE*)location,&bytes)==ERROR_SUCCESS){for(auto exe:{L"\\Launch.exe",L"\\YysLauncher.exe",L"\\onmyoji.exe"}){S path=S(location)+exe;if(fileExists(path)){RegCloseKey(sub);RegCloseKey(h);return path;}}}}
+            if(S(display).find(L"阴阳师")!=S::npos){bytes=sizeof(location);if(RegQueryValueExW(sub,L"InstallLocation",nullptr,nullptr,(BYTE*)location,&bytes)==ERROR_SUCCESS)launchersIn(paths,location);}
             RegCloseKey(sub);
         }RegCloseKey(h);
-    }return L"";
+    }
+    wchar_t drives[512]{};GetLogicalDriveStringsW(512,drives);
+    for(auto drive=drives;*drive;drive+=wcslen(drive)+1)if(GetDriveTypeW(drive)==DRIVE_FIXED){
+        for(auto relative:{L"Netease\\yys",L"NetEase\\Onmyoji",L"Onmyoji",L"Games\\yys",L"Games\\Onmyoji",L"Program Files\\Netease\\yys",L"Program Files (x86)\\Netease\\yys"})launchersIn(paths,S(drive)+relative);
+    }
+    return paths;
+}
+static S detectGame(){auto paths=gameCandidates();return paths.empty()?L"":paths.front();}
+struct ScanResult {std::vector<S> paths;bool limited=false;};
+static ScanResult* pendingScan=nullptr;
+static ScanResult scanGameFolder(const S& root){
+    ScanResult result;std::vector<std::pair<S,int>> folders{{root,0}};ULONGLONG deadline=GetTickCount64()+3000;int entries=0;
+    for(size_t at=0;at<folders.size();at++){
+        if(GetTickCount64()>=deadline||entries>=6000){result.limited=true;break;}
+        auto folder=folders[at].first;int depth=folders[at].second;launchersIn(result.paths,folder);if(depth>=3)continue;
+        WIN32_FIND_DATAW item{};HANDLE search=FindFirstFileW((folder+L"\\*").c_str(),&item);if(search==INVALID_HANDLE_VALUE)continue;
+        do{
+            if(++entries>=6000||GetTickCount64()>=deadline){result.limited=true;break;}
+            if((item.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)&&!(item.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)&&S(item.cFileName)!=L"."&&S(item.cFileName)!=L".."){
+                if(folders.size()<256)folders.push_back({folder+L"\\"+item.cFileName,depth+1});else result.limited=true;
+            }
+        }while(FindNextFileW(search,&item));FindClose(search);
+    }return result;
+}
+static void selectDiscovered(const ScanResult& result){
+    if(result.paths.empty()){status(result.limited?L"扫描已达到范围限制；请选择更接近安装位置的文件夹。":L"未找到客户端；可通过“查找 → 官方下载”安装阴阳师-MuMu模拟器专版。");return;}
+    int index=0;
+    if(result.paths.size()>1){
+        HMENU menu=CreatePopupMenu();for(size_t i=0;i<result.paths.size();i++){S name=result.paths[i];for(size_t p=0;(p=name.find(L'&',p))!=S::npos;p+=2)name.insert(p,L"&");AppendMenuW(menu,MF_STRING,4100+(UINT)i,name.c_str());}
+        RECT rect{};GetWindowRect(controls[AutoFind],&rect);int command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,rect.left,rect.bottom,0,mainWindow,nullptr);DestroyMenu(menu);
+        if(command<4100||command>=4100+(int)result.paths.size())return;index=command-4100;
+    }
+    set(Path,result.paths[index]);persist();status(L"已读取客户端路径："+result.paths[index]+(result.limited?L"（扫描范围有限）":L""));
+}
+struct ScanRequest {S root;HWND panel;};
+static DWORD WINAPI scanWorker(void* data){
+    auto request=(ScanRequest*)data;auto result=new ScanResult(scanGameFolder(request->root));HWND panel=request->panel;delete request;
+    if(!PostMessageW(panel,WM_APP+2,0,(LPARAM)result))delete result;return 0;
+}
+static void browseGameFolder(){
+    IFileDialog* dialog{};if(FAILED(CoCreateInstance(CLSID_FileOpenDialog,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&dialog)))){status(L"无法打开文件夹选择，请使用“选择”指定启动器。");return;}
+    DWORD options{};dialog->GetOptions(&options);dialog->SetOptions(options|FOS_PICKFOLDERS|FOS_FORCEFILESYSTEM|FOS_PATHMUSTEXIST);dialog->SetTitle(L"选择阴阳师安装文件夹（扫描至三层子目录）");
+    S root;if(SUCCEEDED(dialog->Show(mainWindow))){IShellItem* item{};if(SUCCEEDED(dialog->GetResult(&item))){PWSTR path{};if(SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH,&path))){root=path;CoTaskMemFree(path);}item->Release();}}dialog->Release();if(root.empty())return;
+    auto request=new ScanRequest{root,mainWindow};HANDLE worker=CreateThread(nullptr,0,scanWorker,request,0,nullptr);if(!worker){delete request;status(L"扫描无法启动，请重试。");return;}CloseHandle(worker);EnableWindow(controls[AutoFind],FALSE);status(L"正在扫描所选文件夹…");
+}
+static void discoveryMenu(){
+    HMENU menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING,4001,L"自动读取：运行中的客户端 / 安装记录 / 常见目录");AppendMenuW(menu,MF_STRING,4002,L"扫描所选文件夹…");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,4003,L"官方下载 · 阴阳师-MuMu模拟器专版");
+    RECT rect{};GetWindowRect(controls[AutoFind],&rect);int command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,rect.left,rect.bottom,0,mainWindow,nullptr);DestroyMenu(menu);
+    if(command==4001)selectDiscovered({gameCandidates(),false});else if(command==4002)browseGameFolder();else if(command==4003){
+        auto result=(INT_PTR)ShellExecuteW(mainWindow,L"open",OfficialDownload,nullptr,nullptr,SW_SHOWNORMAL);status(result>32?L"已打开官方下载页面，请选择阴阳师-MuMu模拟器专版；安装后再自动查找。":L"无法打开浏览器，请访问 https://yys.163.com/zmb/ 。");
+    }
 }
 static HWND control(int id,const wchar_t* cls,const S& label,DWORD style,DWORD ex=0){
     HWND w=CreateWindowExW(ex,cls,label.c_str(),WS_CHILD|WS_VISIBLE|style,0,0,1,1,mainWindow,(HMENU)(INT_PTR)id,instance,nullptr);controls[id]=w;SendMessageW(w,WM_SETFONT,(WPARAM)bodyFont,TRUE);return w;
@@ -397,26 +559,27 @@ static void layout(){
     RECT r;GetClientRect(mainWindow,&r);int W=MulDiv(r.right,96,dpi),H=MulDiv(r.bottom,96,dpi);int space=W-48;
     auto place=[&](int id,int x,int y,int w,int h){MoveWindow(controls[id],px(x),px(y),px(w),px(h),TRUE);};
     place(Icon,18,9,46,46);place(Header,76,9,148,29);place(Subtitle,78,38,210,20);place(Background,W-259,18,55,30);place(Details,W-196,18,98,30);place(Help,W-90,18,66,30);
-    place(LPath,24,84,54,20);place(Path,82,78,W-174,28);place(Browse,W-84,78,60,28);
+    place(LPath,24,84,54,20);place(Path,82,78,W-244,28);place(AutoFind,W-154,78,64,28);place(Browse,W-84,78,60,28);
     place(LCount,24,124,54,20);place(Count,82,118,46,28);place(LDelay,140,124,82,20);place(Delay,224,118,62,28);place(Launch,W-210,116,118,32);place(Cancel,W-84,116,60,32);
     place(LWindows,24,184,space-100,24);place(Refresh,W-88,178,64,28);
     place(LWidth,24,223,28,20);place(Width,56,217,72,28);place(LHeight,139,223,24,20);place(Height,169,217,72,28);place(LockRatio,254,222,108,24);place(Resize,W-150,216,126,32);
     place(LScreen,24,265,32,20);place(Screen,60,258,W-294,200);place(Arrange,W-218,256,194,34);
     place(LOpacity,24,309,88,20);place(Opacity,116,301,57,28);place(Alpha,182,299,76,32);place(Hide,W-281,299,63,32);place(Show,W-210,299,63,32);place(Restore,W-139,299,115,32);
-    for(int id:{LArgs,Args,LFilter,Filter,Pick,SelectAll,SelectNone,List,SharpLaunch})ShowWindow(controls[id],detailsOpen?SW_SHOW:SW_HIDE);
+    for(int id:{LArgs,Args,LFilter,Filter,Pick,SelectAll,SelectNone,List,SharpLaunch,LBoss,BossEnabled,BossKey,BossSave,BossDisable})ShowWindow(controls[id],detailsOpen?SW_SHOW:SW_HIDE);
     if(detailsOpen){
         place(LFilter,24,368,56,20);place(Filter,84,362,W-260,28);place(Pick,W-168,362,144,28);
         place(LArgs,24,407,56,20);place(Args,84,401,W-108,28);
-        place(SharpLaunch,24,438,380,24);place(SelectAll,W-159,436,63,26);place(SelectNone,W-88,436,64,26);place(List,24,468,space,std::max(60,H-548));
+        place(SharpLaunch,24,438,380,24);place(SelectAll,W-159,436,63,26);place(SelectNone,W-88,436,64,26);
+        place(LBoss,24,480,56,20);place(BossEnabled,84,475,64,28);place(BossKey,156,474,W-364,28);place(BossSave,W-200,472,92,32);place(BossDisable,W-100,472,76,32);place(List,24,514,space,std::max(60,H-594));
     }
-    place(Hint,24,H-55,space,20);MoveWindow(statusWindow,px(24),r.bottom-px(31),r.right-px(48),px(20),TRUE);
+    place(Hint,24,H-54,W-202,20);place(Admin,W-170,H-60,146,28);MoveWindow(statusWindow,px(24),r.bottom-px(31),r.right-px(48),px(20),TRUE);
     if(listWindow){int widths[]={space-280,110,70,100};for(int i=0;i<4;i++)ListView_SetColumnWidth(listWindow,i,px(widths[i]));}
 }
 static void panelSize(){RECT r{0,0,px(580),px(detailsOpen?650:410)};AdjustWindowRectEx(&r,(DWORD)GetWindowLongPtrW(mainWindow,GWL_STYLE),FALSE,0);SetWindowPos(mainWindow,nullptr,0,0,r.right-r.left,r.bottom-r.top,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);layout();InvalidateRect(mainWindow,nullptr,TRUE);}
 static void createUi(){
     sizingFields=true;ratioWidth=1113;ratioHeight=627;
-    fonts();auto icon=control(Icon,L"STATIC",L"",SS_ICON|SS_CENTERIMAGE);SendMessageW(icon,STM_SETICON,(WPARAM)LoadImageW(instance,MAKEINTRESOURCEW(101),IMAGE_ICON,px(46),px(46),LR_DEFAULTCOLOR),0);label(Header,L"鼠卫兵");SendMessageW(controls[Header],WM_SETFONT,(WPARAM)titleFont,TRUE);label(Subtitle,L"阴阳师窗口管家 · 0.2.1");button(Background,L"后台");button(Details,L"窗口 / 设置");button(Help,L"说明");
-    label(LPath,L"游戏");edit(Path,cfg.path);button(Browse,L"选择");label(LArgs,L"参数");edit(Args,cfg.args);
+    fonts();auto icon=control(Icon,L"STATIC",L"",SS_ICON|SS_CENTERIMAGE);SendMessageW(icon,STM_SETICON,(WPARAM)LoadImageW(instance,MAKEINTRESOURCEW(101),IMAGE_ICON,px(46),px(46),LR_DEFAULTCOLOR),0);label(Header,L"鼠卫兵");SendMessageW(controls[Header],WM_SETFONT,(WPARAM)titleFont,TRUE);label(Subtitle,L"阴阳师窗口管家 · 0.3");button(Background,L"后台");button(Details,L"窗口 / 设置");button(Help,L"说明");
+    label(LPath,L"游戏");edit(Path,cfg.path);button(AutoFind,L"查找 ▾");button(Browse,L"选择");label(LArgs,L"参数");edit(Args,cfg.args);
     label(LCount,L"数量");edit(Count,std::to_wstring(cfg.count),true);label(LDelay,L"间隔 / ms");edit(Delay,std::to_wstring(cfg.delay),true);button(Launch,L"启动 / 多开");button(Cancel,L"停止");EnableWindow(controls[Cancel],FALSE);
     label(LFilter,L"进程");edit(Filter,cfg.filter);button(Refresh,L"刷新");button(Pick,L"添加窗口（3 秒）");
     label(LWindows,L"游戏窗口");button(SelectAll,L"全选");button(SelectNone,L"全不选");
@@ -428,7 +591,9 @@ static void createUi(){
     label(LWidth,L"宽");edit(Width,std::to_wstring(cfg.width),true);label(LHeight,L"高");edit(Height,std::to_wstring(cfg.height),true);control(LockRatio,L"BUTTON",L"锁定比例",WS_TABSTOP|BS_AUTOCHECKBOX);SendMessageW(controls[LockRatio],BM_SETCHECK,cfg.lockRatio?BST_CHECKED:BST_UNCHECKED,0);button(Resize,L"应用尺寸");
     label(LScreen,L"屏幕");control(Screen,L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL);
     button(Arrange,L"自动排列 · 右侧纵向");label(LOpacity,L"不透明度 %");edit(Opacity,std::to_wstring(cfg.opacity),true);button(Alpha,L"应用");button(Hide,L"隐藏");button(Show,L"显示");button(Restore,L"恢复布局");
-    label(Hint,L"右侧向下，排满向左 · 排列只移动，尺寸单独应用");
+    label(LBoss,L"老板键");control(BossEnabled,L"BUTTON",L"启用",WS_TABSTOP|BS_AUTOCHECKBOX);SendMessageW(controls[BossEnabled],BM_SETCHECK,cfg.bossEnabled?BST_CHECKED:BST_UNCHECKED,0);
+    control(BossKey,HOTKEY_CLASSW,L"",WS_TABSTOP);SendMessageW(controls[BossKey],HKM_SETHOTKEY,hotkeyControlValue(cfg.bossKey,cfg.bossMods),0);button(BossSave,L"保存快捷键");button(BossDisable,L"停用");
+    label(Hint,adminHint(elevated));control(Admin,L"BUTTON",elevated?L"已是管理员":L"管理员启动",WS_TABSTOP|BS_PUSHBUTTON);EnableWindow(controls[Admin],!elevated);if(!elevated)SendMessageW(controls[Admin],BCM_SETSHIELD,0,TRUE);
     statusWindow=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_LEFT|SS_ENDELLIPSIS,0,0,0,0,mainWindow,nullptr,instance,nullptr);SendMessageW(statusWindow,WM_SETFONT,(WPARAM)bodyFont,TRUE);
     sizingFields=false;screens();layout();refresh();status(L"就绪 · 默认选择全部游戏窗口");
 }
@@ -438,7 +603,7 @@ static bool addTray(){
     tray.cbSize=sizeof(tray);tray.hWnd=mainWindow;tray.uID=1;tray.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP|NIF_SHOWTIP;tray.uCallbackMessage=TrayMessage;tray.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(101));wcscpy_s(tray.szTip,L"鼠卫兵 · 双击打开，右键退出");
     trayReady=Shell_NotifyIconW(NIM_ADD,&tray)!=0;if(trayReady){tray.uVersion=NOTIFYICON_VERSION_4;Shell_NotifyIconW(NIM_SETVERSION,&tray);}return trayReady;
 }
-static void openPanel(){ShowWindow(mainWindow,SW_RESTORE);SetForegroundWindow(mainWindow);}
+static void openPanel(){ShowWindow(mainWindow,SW_RESTORE);SetForegroundWindow(mainWindow);if(pendingScan){auto result=pendingScan;pendingScan=nullptr;selectDiscovered(*result);delete result;}}
 static void trayMenu(){POINT p;GetCursorPos(&p);HMENU menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING,2001,L"打开鼠卫兵");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,2002,L"退出程序");SetForegroundWindow(mainWindow);int choice=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,p.x,p.y,0,mainWindow,nullptr);DestroyMenu(menu);PostMessageW(mainWindow,WM_NULL,0,0);if(choice==2001)openPanel();else if(choice==2002)SendMessageW(mainWindow,WM_CLOSE,0,0);}
 static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
     if(taskbarCreated&&msg==taskbarCreated){addTray();return 0;}
@@ -452,9 +617,13 @@ static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
     case WM_DRAWITEM:drawButton((DRAWITEMSTRUCT*)lp);return TRUE;
     case WM_CTLCOLORSTATIC:{HDC dc=(HDC)wp;SetBkMode(dc,TRANSPARENT);SetTextColor(dc,(HWND)lp==controls[Header]?RGB(35,58,100):RGB(64,76,93));bool head=(HWND)lp==controls[Header]||(HWND)lp==controls[Subtitle]||(HWND)lp==controls[Icon]||(HWND)lp==controls[Hint]||(HWND)lp==statusWindow;return (LRESULT)(head?background:cardBrush);}
     case WM_NOTIFY:if(((NMHDR*)lp)->hwndFrom==listWindow&&((NMHDR*)lp)->code==LVN_ITEMCHANGED&&!loadingList)summary();return 0;
+    case WM_APP+2:{auto result=(ScanResult*)lp;EnableWindow(controls[AutoFind],TRUE);if(!IsWindowVisible(w)||IsIconic(w)){delete pendingScan;pendingScan=result;status(L"文件夹扫描已完成，打开面板后选择客户端。");}else{selectDiscovered(*result);delete result;}return 0;}
+    case WM_HOTKEY:if(bossRegistered&&(int)wp==bossRegistration&&!(GetForegroundWindow()==w&&GetFocus()==controls[BossKey]))toggleBoss();return 0;
     case TrayMessage:if(LOWORD(lp)==WM_LBUTTONDBLCLK||LOWORD(lp)==NIN_SELECT||LOWORD(lp)==NIN_KEYSELECT)openPanel();else if(LOWORD(lp)==WM_CONTEXTMENU||LOWORD(lp)==WM_RBUTTONUP)trayMenu();return 0;
     case WM_COMMAND:if(HIWORD(wp)==EN_CHANGE&&(LOWORD(wp)==Width||LOWORD(wp)==Height)){sizeChanged(LOWORD(wp));return 0;}if(HIWORD(wp)==BN_CLICKED)switch(LOWORD(wp)){
         case Browse:browse();break;case Refresh:refresh();persist();status(L"游戏窗口已刷新。");break;
+        case Admin:restartAdmin();break;case BossSave:saveBossKey();break;case BossDisable:saveBossKey(true);break;
+        case AutoFind:discoveryMenu();break;
         case Details:detailsOpen=!detailsOpen;set(Details,detailsOpen?L"收起设置":L"窗口 / 设置");panelSize();break;
         case Background:if(trayReady||addTray())ShowWindow(w,SW_MINIMIZE);else status(L"托盘暂时不可用，可用任务栏最小化。");break;
         case SharpLaunch:persist();status(L"启动选项已保存；下次启动游戏时生效。");break;
@@ -463,29 +632,33 @@ static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
         case Launch:beginLaunch();break;case Cancel:KillTimer(w,1);launchRemaining=0;EnableWindow(controls[Launch],TRUE);EnableWindow(controls[Cancel],FALSE);status(L"启动队列已停止；已启动的游戏继续运行。");break;
         case Pick:EnableWindow(controls[Pick],FALSE);SetTimer(w,2,3000,nullptr);status(L"请在 3 秒内切换到要管理的游戏窗口。");break;
         case Resize:case Arrange:case Alpha:case Hide:case Show:case Restore:operate(LOWORD(wp));break;
-        case Help:MessageBoxW(w,L"默认选择全部游戏窗口，直接使用常用操作即可。\n“窗口 / 设置”可展开窗口选择、进程筛选与启动参数。\n\n默认比例 1113:627（约 16:9），例如宽 980 时高为 552。修改宽或高，另一项自动跟随。取消锁定后可自定义比例，再勾选锁定。点击“应用尺寸”调整游戏内容区。\n自动排列：从屏幕右上角向下排，纵向放不下时向左增加一列。只移动，保持窗口当前大小；整屏放不下时会提示先调小尺寸。\n\n最小化或“后台”进入托盘，双击托盘图标或右键“打开”恢复。右键“退出”或窗口关闭按钮真正退出，显示本程序隐藏的游戏窗口。\n\n“恢复布局”恢复本次会话首次修改前的布局与透明度。多开仍受客户端实例限制；建议游戏使用窗口模式。",L"鼠卫兵 · 使用说明",MB_OK|MB_ICONINFORMATION);break;
+        case Help:MessageBoxW(w,L"默认选择全部游戏窗口；展开“窗口 / 设置”可选择部分窗口。\n\n客户端：点“查找”读取运行中的客户端、安装记录及常见目录，或扫描所选文件夹。推荐从 https://yys.163.com/zmb/ 下载阴阳师-MuMu模拟器专版。\n\n管理员：底部显示权限状态；普通权限可点“管理员启动”，接受 Windows 提示后重启本程序。取消提示会继续使用当前程序。\n\n老板键：默认 Ctrl + Alt + H，隐藏已选的可见游戏窗口并将面板收起；再次按恢复同一批窗口。此前已隐藏的窗口保持隐藏。展开设置，点击快捷键框按下新组合，再点“保存快捷键”；可停用。支持 Ctrl/Alt/Shift 组合及 F1–F11；占用时提示更换。\n\n默认比例 1113:627，宽 980 时高为 552。“应用尺寸”单独调整大小；“自动排列”只移动，从右上角向下，排满向左。\n\n最小化或“后台”进入托盘，双击或右键“打开”恢复。右键退出或窗口关闭真正退出，显示本程序隐藏的游戏窗口。\n“恢复布局”恢复本次会话首次修改前的位置、大小与透明度。多开仍受客户端限制；建议游戏使用窗口模式。",L"鼠卫兵 · 使用说明",MB_OK|MB_ICONINFORMATION);break;
         }return 0;
     case WM_TIMER:switch(wp){
         case 1:launchOne();break;
         case 2:{KillTimer(w,2);EnableWindow(controls[Pick],TRUE);HWND fg=GetForegroundWindow();Target t=targetOf(fg);if(fg&&fg!=w&&t.pid!=GetCurrentProcessId()&&valid(t)&&!t.title.empty()){manualTargets.push_back(t);refresh();status(L"已添加窗口："+t.title);}else status(L"没有选到有效窗口，请重试并切换到游戏。");break;}
         case 3:KillTimer(w,3);for(auto i=hidden.begin();i!=hidden.end();){if(!valid(i->second)||IsWindowVisible(i->first))i=hidden.erase(i);else ++i;}saveHidden();refresh();break;
         case 4:arrangementTick();break;
+        case 5:bossFinishTick();break;
         case 9:KillTimer(w,9);DestroyWindow(w);break;
         }return 0;
     case WM_CLOSE:stopArrangement();persist();restoreHidden();DestroyWindow(w);return 0;
-    case WM_DESTROY:if(trayReady)Shell_NotifyIconW(NIM_DELETE,&tray);trayReady=false;PostQuitMessage(0);return 0;
+    case WM_DESTROY:delete pendingScan;pendingScan=nullptr;if(bossRegistered)UnregisterHotKey(w,bossRegistration);bossRegistered=false;if(trayReady)Shell_NotifyIconW(NIM_DELETE,&tray);trayReady=false;PostQuitMessage(0);return 0;
     }return DefWindowProcW(w,msg,wp,lp);
 }
 static bool selfTest(const S& dir){
     CreateDirectoryW(dir.c_str(),nullptr);int failed=0,count=0;auto check=[&](bool ok,const char* name){count++;printf("%s %s\n",ok?"PASS":"FAIL",name);if(!ok)failed++;};
     Settings a;a.path=L"C:\\游戏目录\\Launch.exe";a.args=L"--name \"中文账户\"";auto b=encode(a);Settings c;
     check(decode(b,c)&&c.path==a.path&&c.args==a.args&&c.width==1113&&c.height==627,"unicode settings round trip");
-    auto legacy=[&](bool withRatio){
+    auto legacy=[&](int fields){
         S data((const wchar_t*)(b.data()+8),(b.size()-8)/2);
-        for(auto line:{L"sharpLaunch=1\n",withRatio?L"":L"lockRatio=1\n"}){if(!*line)continue;auto pos=data.find(line);if(pos!=S::npos)data.erase(pos,wcslen(line));}
+        for(auto line:{L"bossEnabled=1\n",L"bossKey=72\n",L"bossMods=3\n",fields<11?L"sharpLaunch=1\n":L"",fields<10?L"lockRatio=1\n":L""}){if(!*line)continue;auto pos=data.find(line);if(pos!=S::npos)data.erase(pos,wcslen(line));}
         std::vector<unsigned char> bytes(8+data.size()*2);auto checkSum=hash(data.data(),data.size()*2);memcpy(bytes.data(),&checkSum,8);memcpy(bytes.data()+8,data.data(),data.size()*2);return bytes;
     };
-    check(decode(legacy(false),c)&&c.lockRatio&&c.sharpLaunch&&decode(legacy(true),c)&&c.sharpLaunch,"older nine and ten field settings retain launch compatibility");
+    check(decode(legacy(9),c)&&c.lockRatio&&c.sharpLaunch&&decode(legacy(10),c)&&c.sharpLaunch&&decode(legacy(11),c)&&c.bossEnabled&&c.bossKey=='H',"older nine, ten and eleven field settings retain compatibility and default boss key");
+    auto customBoss=a;customBoss.bossEnabled=false;customBoss.bossKey=VK_F8;customBoss.bossMods=MOD_CONTROL|MOD_SHIFT;check(decode(encode(customBoss),c)&&!c.bossEnabled&&c.bossKey==VK_F8&&c.bossMods==(MOD_CONTROL|MOD_SHIFT),"custom boss key and disabled state round trip");
+    check(validBossKey('H',MOD_CONTROL|MOD_ALT)&&validBossKey(VK_F8,0)&&!validBossKey(VK_F12,MOD_CONTROL)&&!validBossKey('H',0)&&!validBossKey(VK_CONTROL,MOD_CONTROL),"boss key rejects reserved and bare typing keys");
+    check(hotkeyModifiers(hotkeyControlValue('H',MOD_CONTROL|MOD_ALT|MOD_SHIFT))==(MOD_CONTROL|MOD_ALT|MOD_SHIFT),"native hotkey modifier mapping round trip");
     auto launchSettings=a;launchSettings.sharpLaunch=false;check(decode(encode(launchSettings),c)&&!c.sharpLaunch,"sharp launch preference round trip");
     check(sharpCompatibility(L"~ RUNASADMIN DPIUNAWARE GdiDpiScaling HighDpiAware")==L"RUNASADMIN HIGHDPIAWARE","sharp launch replaces conflicting DPI flags and preserves other compatibility flags");
     auto launchEnv=launchEnvironment(true);bool envGood=launchEnv.size()>2&&launchEnv[launchEnv.size()-1]==0&&launchEnv[launchEnv.size()-2]==0;int layers=0;
@@ -518,10 +691,12 @@ static bool selfTest(const S& dir){
     configDir=dir;hidden[t.hwnd]=t;check(saveHidden(),"hidden identity journal saved");ShowWindow(fake,SW_HIDE);hidden.clear();loadHidden();check(hidden.size()==1&&valid(hidden.begin()->second),"hidden window recovered from journal");restoreHidden();
     MSG pending{};while(PeekMessageW(&pending,nullptr,0,0,PM_REMOVE)){TranslateMessage(&pending);DispatchMessageW(&pending);}check(IsWindowVisible(fake)!=0,"owned hidden window restored");
     DestroyWindow(fake);check(!valid(t),"destroyed window rejected");saved.clear();hidden.clear();
-    INITCOMMONCONTROLSEX cc{sizeof(cc),ICC_LISTVIEW_CLASSES|ICC_STANDARD_CLASSES};InitCommonControlsEx(&cc);background=CreateSolidBrush(RGB(244,246,250));cardBrush=CreateSolidBrush(RGB(255,255,255));
+    INITCOMMONCONTROLSEX cc{sizeof(cc),ICC_LISTVIEW_CLASSES|ICC_STANDARD_CLASSES|ICC_HOTKEY_CLASS};InitCommonControlsEx(&cc);background=CreateSolidBrush(RGB(244,246,250));cardBrush=CreateSolidBrush(RGB(255,255,255));
     WNDCLASSW wc{};wc.hInstance=instance;wc.lpszClassName=L"SWB.TestPanel";wc.lpfnWndProc=proc;RegisterClassW(&wc);
     HWND panel=CreateWindowExW(0,wc.lpszClassName,L"SWB Test Panel",WS_OVERLAPPEDWINDOW,0,0,600,450,nullptr,nullptr,instance,nullptr);panelSize();RECT client{};GetClientRect(panel,&client);
     check(panel&&client.right==px(580)&&client.bottom==px(410)&&!(GetWindowLongPtrW(listWindow,GWL_STYLE)&WS_VISIBLE),"compact panel size and collapsed list");
+    check(controls[BossKey]&&value(Hint)==adminHint(false)&&IsWindowEnabled(controls[Admin]),"native boss key control and normal privilege hint are available");
+    check(adminHint(true)!=adminHint(false)&&adminHint(true).find(L"管理员")!=S::npos,"administrator hint distinguishes elevated execution");
     RECT footer{};GetWindowRect(statusWindow,&footer);MapWindowPoints(nullptr,panel,(POINT*)&footer,2);check(footer.left==px(24)&&footer.right==client.right-px(24)&&footer.bottom<=client.bottom-px(10),"footer horizontal and bottom padding");
     set(Width,L"980");check(value(Height)==L"552","editing width follows game default aspect ratio");set(Height,L"627");check(value(Width)==L"1113","editing height follows game default aspect ratio");
     SendMessageW(controls[LockRatio],BM_SETCHECK,BST_UNCHECKED,0);set(Width,L"500");check(value(Height)==L"627","unlocked dimensions can be edited independently");
@@ -565,7 +740,34 @@ static bool selfTest(const S& dir){
         };
         check(runProbe(false)&&runProbe(true),"real child process uses same launch environment to switch from DPI unaware to aware");
     }
-    detailsOpen=true;panelSize();check((GetWindowLongPtrW(listWindow,GWL_STYLE)&WS_VISIBLE)!=0,"optional window selection expands");detailsOpen=false;panelSize();check(!(GetWindowLongPtrW(listWindow,GWL_STYLE)&WS_VISIBLE),"window list collapses again");check(addTray(),"system tray icon registration");DestroyWindow(panel);check(!trayReady,"tray icon removed on program exit");
+    configPath=dir+L"\\manager-settings.dat";
+    bool registered=false;int testKey=VK_F6,testMods=MOD_CONTROL|MOD_ALT|MOD_SHIFT;
+    for(;testKey<=VK_F11;testKey++)if(registerBoss(true,testKey,testMods,false)){registered=true;break;}
+    check(registered,"global boss key registration");cfg.bossKey=testKey;cfg.bossMods=testMods;cfg.bossEnabled=registered;
+    int collisionKey='A';bool reserved=false;for(;collisionKey<='Z';collisionKey++)if(RegisterHotKey(panel,3099,testMods|MOD_NOREPEAT,collisionKey)){reserved=true;break;}
+    int previousId=bossRegistration;
+    check(reserved&&!registerBoss(true,collisionKey,testMods,false)&&bossRegistered&&bossRegistration==previousId&&registeredKey==testKey,"conflicting boss key preserves original registration");
+    if(reserved)UnregisterHotKey(panel,3099);
+    SendMessageW(controls[BossKey],HKM_SETHOTKEY,hotkeyControlValue(testKey,testMods),0);saveBossKey();Settings loadedBoss;int bossSource=0;
+    check(loadSettings(configPath,loadedBoss,bossSource)&&loadedBoss.bossKey==testKey&&loadedBoss.bossMods==testMods,"custom boss key saved through native settings controls");
+    HWND visible=CreateWindowExW(0,L"STATIC",L"Boss Visible Test",WS_OVERLAPPEDWINDOW|WS_VISIBLE,0,0,320,180,nullptr,nullptr,instance,nullptr);
+    HWND prehidden=CreateWindowExW(0,L"STATIC",L"Boss Prehidden Test",WS_OVERLAPPEDWINDOW,0,0,320,180,nullptr,nullptr,instance,nullptr);
+    Target vt=targetOf(visible),pt=targetOf(prehidden);hidden[prehidden]=pt;
+    auto finishBoss=[&](){ULONGLONG end=GetTickCount64()+2200;while(bossBusy&&GetTickCount64()<end){MSG message{};while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){TranslateMessage(&message);DispatchMessageW(&message);}bossFinishTick();Sleep(20);}};
+    toggleBossRows({vt,pt});finishBoss();
+    check(bossActive&&!bossBusy&&!IsWindowVisible(visible)&&bossHidden.size()==1&&bossHidden.count(visible),"boss key hides only visible targets and journals ownership");
+    toggleBossRows({pt});finishBoss();
+    check(!bossActive&&IsWindowVisible(visible)&&!IsWindowVisible(prehidden)&&hidden.count(prehidden)&&!hidden.count(visible),"boss restore uses original batch and preserves previously hidden windows");
+    toggleBossRows({vt});finishBoss();DestroyWindow(visible);toggleBossRows({});finishBoss();check(!bossActive&&bossHidden.empty(),"closed boss target is safely discarded on restore");
+    DestroyWindow(prehidden);hidden.clear();bossHidden.clear();saveBossKey(true);check(!bossRegistered&&!cfg.bossEnabled,"boss key disabled and unregistered from settings");
+    S scanRoot=dir+L"\\directory-discovery",nested=scanRoot+L"\\Netease",game=nested+L"\\yys";CreateDirectoryW(scanRoot.c_str(),nullptr);CreateDirectoryW(nested.c_str(),nullptr);CreateDirectoryW(game.c_str(),nullptr);CreateDirectoryW((game+L"\\bin").c_str(),nullptr);
+    unsigned char dummy=0;atomicWrite(game+L"\\launch.exe",&dummy,1);auto scanned=scanGameFolder(scanRoot);std::vector<S> fromBin;launchersIn(fromBin,game+L"\\bin");
+    check(scanned.paths.size()==1&&lower(scanned.paths.front())==lower(game+L"\\launch.exe")&&!scanned.limited,"selected folder scan finds nested launcher");
+    check(fromBin.size()==1&&lower(fromBin.front())==lower(game+L"\\launch.exe"),"running executable bin directory maps to parent launcher");
+    addGamePath(fromBin,game+L"\\LAUNCH.EXE");addGamePath(fromBin,game+L"\\missing.exe");check(fromBin.size()==1,"directory candidates deduplicate case and ignore missing executables");
+    check(scanGameFolder(scanRoot+L"\\missing").paths.empty(),"missing scan folder returns no candidates");
+    check(S(OfficialDownload)==L"https://yys.163.com/zmb/","official download uses user supplied URL");
+    detailsOpen=true;panelSize();check((GetWindowLongPtrW(listWindow,GWL_STYLE)&WS_VISIBLE)&&(GetWindowLongPtrW(controls[BossKey],GWL_STYLE)&WS_VISIBLE),"window selection and boss key settings expand");detailsOpen=false;panelSize();check(!(GetWindowLongPtrW(listWindow,GWL_STYLE)&WS_VISIBLE)&&!(GetWindowLongPtrW(controls[BossKey],GWL_STYLE)&WS_VISIBLE),"window list and boss settings collapse again");check(addTray(),"system tray icon registration");registerBoss(true,testKey,testMods,false);DestroyWindow(panel);check(!trayReady&&!bossRegistered,"tray and boss key removed on program exit");
     printf("RESULT %d/%d passed\n",count-failed,count);return failed==0;
 }
 static S geometryReport(const Target& t){
@@ -585,17 +787,21 @@ static S geometryReport(const Target& t){
 }
 int WINAPI wWinMain(HINSTANCE h,HINSTANCE,LPWSTR,int show){
     instance=h;int argc=0;LPWSTR* argv=CommandLineToArgvW(GetCommandLineW(),&argc);
-    bool diagnostics=false;
-    for(int i=1;i<argc;i++){if(S(argv[i])==L"--self-test")testMode=true;if(S(argv[i])==L"--smoke-test")smokeMode=true;if(S(argv[i])==L"--diagnose")diagnostics=true;}
+    bool diagnostics=false,discoverReport=false;int waitParent=0;
+    for(int i=1;i<argc;i++){if(S(argv[i])==L"--self-test")testMode=true;if(S(argv[i])==L"--smoke-test")smokeMode=true;if(S(argv[i])==L"--diagnose")diagnostics=true;if(S(argv[i])==L"--discover")discoverReport=true;if(S(argv[i])==L"--wait-parent"&&i+1<argc)number(argv[++i],1,99999999,waitParent);}
+    if(discoverReport&&argc>2){S output=L"\uFEFF鼠卫兵自动读取客户端路径\r\n";for(auto& path:gameCandidates())output+=path+L"\r\n";bool ok=atomicWrite(argv[argc-1],output.data(),output.size()*2);LocalFree(argv);return ok?0:1;}
     if(diagnostics&&argc>2){EnumWindows(enumTarget,(LPARAM)&cfg.filter);S report=L"\uFEFF鼠卫兵窗口识别诊断\r\n筛选："+cfg.filter+L"\r\n窗口数量："+std::to_wstring(targets.size())+L"\r\n";for(auto& t:targets)report+=L"PID="+std::to_wstring(t.pid)+L" | "+t.process+L" | "+t.title+L" | 身份有效="+(valid(t)?L"是":L"否")+L"\r\n"+geometryReport(t);bool ok=atomicWrite(argv[argc-1],report.data(),report.size()*sizeof(wchar_t));LocalFree(argv);return ok?0:1;}
     if(testMode){S dir=argc>2?argv[argc-1]:L".";CreateDirectoryW(dir.c_str(),nullptr);FILE* file;_wfreopen_s(&file,(dir+L"\\test-results.txt").c_str(),L"w",stdout);bool ok=selfTest(dir);fflush(stdout);LocalFree(argv);return ok?0:1;}
     LocalFree(argv);
+    if(waitParent){HANDLE parent=OpenProcess(SYNCHRONIZE,FALSE,waitParent);if(parent){DWORD result=WaitForSingleObject(parent,10000);CloseHandle(parent);if(result!=WAIT_OBJECT_0){MessageBoxW(nullptr,L"原窗口尚未退出，请退出原鼠卫兵后再以管理员身份运行。",L"鼠卫兵",MB_OK|MB_ICONINFORMATION);return 1;}}}
+    elevated=isElevated();
+    HRESULT com=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     // A single manager avoids competing launch queues and lost hidden-window ownership.
-    HANDLE mutex=CreateMutexW(nullptr,FALSE,smokeMode?L"Local\\ShuWeiBing.Smoke.02":L"Local\\ShuWeiBing.Manager.01");if(mutex&&GetLastError()==ERROR_ALREADY_EXISTS){HWND old=FindWindowW(L"ShuWeiBing.Window",nullptr);if(old){ShowWindow(old,SW_RESTORE);SetForegroundWindow(old);}CloseHandle(mutex);return 0;}
+    HANDLE mutex=CreateMutexW(nullptr,FALSE,smokeMode?L"Local\\ShuWeiBing.Smoke.02":L"Local\\ShuWeiBing.Manager.01");if(!mutex){MessageBoxW(nullptr,L"无法取得程序运行锁。若已有以管理员身份运行的鼠卫兵，请先退出该程序后再打开。",L"鼠卫兵 · 启动提示",MB_OK|MB_ICONINFORMATION);if(SUCCEEDED(com))CoUninitialize();return 1;}if(GetLastError()==ERROR_ALREADY_EXISTS){HWND old=FindWindowW(L"ShuWeiBing.Window",nullptr);if(old){ShowWindow(old,SW_RESTORE);SetForegroundWindow(old);}CloseHandle(mutex);if(SUCCEEDED(com))CoUninitialize();return 0;}
     wchar_t local[MAX_PATH]{};if(SHGetFolderPathW(nullptr,CSIDL_LOCAL_APPDATA,nullptr,SHGFP_TYPE_CURRENT,local)!=S_OK){MessageBoxW(nullptr,L"无法找到用户配置目录。",L"鼠卫兵",MB_OK|MB_ICONERROR);return 1;}
     configDir=S(local)+L"\\ShuWeiBing";CreateDirectoryW(configDir.c_str(),nullptr);configPath=configDir+L"\\settings.dat";
     int source;loadSettings(configPath,cfg,source);if(cfg.path.empty())cfg.path=detectGame();loadHidden();
-    INITCOMMONCONTROLSEX cc{sizeof(cc),ICC_LISTVIEW_CLASSES|ICC_STANDARD_CLASSES};InitCommonControlsEx(&cc);
+    INITCOMMONCONTROLSEX cc{sizeof(cc),ICC_LISTVIEW_CLASSES|ICC_STANDARD_CLASSES|ICC_HOTKEY_CLASS};InitCommonControlsEx(&cc);
     background=CreateSolidBrush(RGB(244,246,250));cardBrush=CreateSolidBrush(RGB(255,255,255));WNDCLASSEXW wc{};wc.cbSize=sizeof(wc);wc.hInstance=h;wc.lpszClassName=L"ShuWeiBing.Window";wc.lpfnWndProc=proc;wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.hbrBackground=background;wc.hIcon=LoadIconW(h,MAKEINTRESOURCEW(101));wc.hIconSm=wc.hIcon;RegisterClassExW(&wc);
     auto systemDpi=(UINT(WINAPI*)())GetProcAddress(GetModuleHandleW(L"user32.dll"),"GetDpiForSystem");if(systemDpi)dpi=(int)systemDpi();
     RECT initial{0,0,px(580),px(410)};AdjustWindowRectEx(&initial,WS_OVERLAPPEDWINDOW,FALSE,0);
@@ -603,6 +809,7 @@ int WINAPI wWinMain(HINSTANCE h,HINSTANCE,LPWSTR,int show){
     if(!w)return 1;DWORD corner=2;DwmSetWindowAttribute(w,33,&corner,sizeof(corner));taskbarCreated=RegisterWindowMessageW(L"TaskbarCreated");addTray();ShowWindow(w,show);UpdateWindow(w);
     if(!hidden.empty())status(L"找到上次隐藏的 "+std::to_wstring(hidden.size())+L" 个窗口；点击“显示”可恢复。");
     else if(source==1)status(L"配置损坏，已恢复有效备份。窗口管理可正常使用。");else if(source==2&&fileExists(configPath))status(L"配置及备份无法读取，已使用默认设置；重新填写后会安全保存。");
+    if(!smokeMode&&cfg.bossEnabled&&!registerBoss(true,cfg.bossKey,cfg.bossMods))status(L"老板键暂不可用，请展开设置更换快捷键；其余功能可正常使用。");
     MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){if(!IsDialogMessageW(w,&msg)){TranslateMessage(&msg);DispatchMessageW(&msg);}}
-    if(mutex)CloseHandle(mutex);DeleteObject(bodyFont);DeleteObject(titleFont);DeleteObject(background);DeleteObject(cardBrush);return (int)msg.wParam;
+    if(mutex)CloseHandle(mutex);DeleteObject(bodyFont);DeleteObject(titleFont);DeleteObject(background);DeleteObject(cardBrush);if(SUCCEEDED(com))CoUninitialize();return (int)msg.wParam;
 }
