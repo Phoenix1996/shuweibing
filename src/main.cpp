@@ -1,4 +1,4 @@
-// 鼠卫兵 0.3 — native Win32, no background service or game injection.
+// 鼠卫兵 0.3.1 — native Win32, no background service or game injection.
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -39,6 +39,7 @@ struct Saved {
 };
 struct Monitor { HMONITOR handle; RECT work; S name; };
 struct Cell { int x,y,w,h; };
+struct LaunchSpec {S executable,args,directory;bool directClient=false;};
 static HWND mainWindow, listWindow, statusWindow;
 static HINSTANCE instance;
 static HFONT bodyFont, titleFont;
@@ -63,7 +64,7 @@ static std::vector<Monitor> monitors;
 struct Arrangement { std::vector<Target> rows; HMONITOR monitor{}; int ticks=0, stable=0; };
 static Arrangement arrangement;
 static int launchRemaining=0, launchTotal=0;
-static S launchPath, launchArgs;
+static LaunchSpec launchSpec;
 static std::map<int,HWND> controls;
 enum {
     Path=100, Browse, Args, Count, Delay, Launch, Cancel, Filter, Refresh,
@@ -427,23 +428,39 @@ static void restartAdmin(){
     if(!ShellExecuteExW(&request)){DWORD error=GetLastError();status(error==ERROR_CANCELLED?L"已取消管理员启动，当前程序继续运行。":L"管理员启动失败。"+winError(error));return;}
     if(request.hProcess)CloseHandle(request.hProcess);SendMessageW(mainWindow,WM_CLOSE,0,0);
 }
+static bool resolveLaunch(const S& path,const S& args,LaunchSpec& output,S& error){
+    if(!fileExists(path)||lower(path).size()<4||lower(path).substr(path.size()-4)!=L".exe"){error=L"请选择存在的客户端或启动器 .exe 文件。";return false;}
+    LaunchSpec candidate{path,args,folderOf(path),false};S name=lower(path.substr(path.find_last_of(L"\\/")+1));
+    if(name==L"launch.exe"||name==L"yyslauncher.exe"){
+        S client=candidate.directory+L"\\bin\\onmyoji.exe";
+        if(!fileExists(client)){error=L"该目录缺少 bin\\onmyoji.exe，不能用此启动器追加多开。请通过“查找”选择阴阳师-MuMu模拟器专版，或先用官方启动器完成安装更新。";return false;}
+        candidate.executable=client;candidate.directClient=true;
+    }else if(name==L"onmyoji.exe"){
+        if(lower(candidate.directory.substr(candidate.directory.find_last_of(L"\\/")+1))==L"bin")candidate.directory=folderOf(candidate.directory);
+        candidate.directClient=true;
+    }
+    output=candidate;return true;
+}
+static bool spawnClient(const LaunchSpec& spec,bool sharp,PROCESS_INFORMATION& process){
+    S command=L"\""+spec.executable+L"\""+(spec.args.empty()?L"":L" "+spec.args);std::vector<wchar_t> buffer(command.begin(),command.end());buffer.push_back(0);
+    STARTUPINFOW startup{};startup.cb=sizeof(startup);auto environment=launchEnvironment(sharp);
+    if(environment.empty()){SetLastError(ERROR_ENVVAR_NOT_FOUND);return false;}
+    return CreateProcessW(spec.executable.c_str(),buffer.data(),nullptr,nullptr,FALSE,CREATE_UNICODE_ENVIRONMENT,environment.data(),spec.directory.empty()?nullptr:spec.directory.c_str(),&startup,&process)!=0;
+}
 static void launchOne(){
     if(launchRemaining<=0)return;
-    S command=L"\""+launchPath+L"\""+(launchArgs.empty()?L"":L" "+launchArgs);std::vector<wchar_t> buffer(command.begin(),command.end());buffer.push_back(0);
-    STARTUPINFOW si{};si.cb=sizeof(si);PROCESS_INFORMATION pi{};S cwd=folderOf(launchPath);
-    auto environment=launchEnvironment(cfg.sharpLaunch);
-    if(environment.empty()){status(L"无法读取启动环境，已停止启动队列。");launchRemaining=0;KillTimer(mainWindow,1);EnableWindow(controls[Launch],TRUE);EnableWindow(controls[Cancel],FALSE);return;}
+    PROCESS_INFORMATION pi{};
     // A private child environment avoids persistent registry or global environment changes.
-    if(!CreateProcessW(launchPath.c_str(),buffer.data(),nullptr,nullptr,FALSE,CREATE_UNICODE_ENVIRONMENT,environment.data(),cwd.empty()?nullptr:cwd.c_str(),&si,&pi)){
+    if(!spawnClient(launchSpec,cfg.sharpLaunch,pi)){
         DWORD e=GetLastError();launchRemaining=0;KillTimer(mainWindow,1);EnableWindow(controls[Launch],TRUE);EnableWindow(controls[Cancel],FALSE);status(L"启动失败。"+winError(e)+(e==ERROR_ELEVATION_REQUIRED?L"该启动器要求管理员权限，可手动打开后再管理窗口。":L""));return;
     }
-    CloseHandle(pi.hThread);CloseHandle(pi.hProcess);launchRemaining--;status(L"已启动 "+std::to_wstring(launchTotal-launchRemaining)+L" / "+std::to_wstring(launchTotal)+L"。实际多开取决于游戏客户端是否允许多个实例。");
+    CloseHandle(pi.hThread);CloseHandle(pi.hProcess);launchRemaining--;status(L"已启动 "+std::to_wstring(launchTotal-launchRemaining)+L" / "+std::to_wstring(launchTotal)+(launchSpec.directClient?L" 个独立游戏进程。":L" 个进程。"));
     if(launchRemaining==0){KillTimer(mainWindow,1);EnableWindow(controls[Launch],TRUE);EnableWindow(controls[Cancel],FALSE);SetTimer(mainWindow,3,1500,nullptr);}
 }
 static void beginLaunch(){
-    Settings c;if(!collect(c))return;DWORD attr=GetFileAttributesW(c.path.c_str());
-    if(attr==INVALID_FILE_ATTRIBUTES||(attr&FILE_ATTRIBUTE_DIRECTORY)||lower(c.path).size()<4||lower(c.path).substr(c.path.size()-4)!=L".exe"){status(L"请选择存在的游戏客户端或启动器 .exe 文件。");return;}
-    cfg=c;persist();launchPath=c.path;launchArgs=c.args;launchRemaining=launchTotal=c.count;EnableWindow(controls[Launch],FALSE);EnableWindow(controls[Cancel],TRUE);SetTimer(mainWindow,1,c.delay,nullptr);launchOne();
+    if(launchRemaining>0)return;Settings c;if(!collect(c))return;LaunchSpec next;S error;
+    if(!resolveLaunch(c.path,c.args,next,error)){status(error);return;}
+    cfg=c;persist();launchSpec=next;launchRemaining=launchTotal=c.count;EnableWindow(controls[Launch],FALSE);EnableWindow(controls[Cancel],TRUE);SetTimer(mainWindow,1,c.delay,nullptr);launchOne();
 }
 static void browse(){wchar_t path[32768]{};OPENFILENAMEW o{};o.lStructSize=sizeof(o);o.hwndOwner=mainWindow;o.lpstrFilter=L"游戏或启动器 (*.exe)\0*.exe\0\0";o.lpstrFile=path;o.nMaxFile=32768;o.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;if(GetOpenFileNameW(&o)){set(Path,path);persist();}}
 static const wchar_t* OfficialDownload=L"https://yys.163.com/zmb/";
@@ -578,7 +595,7 @@ static void layout(){
 static void panelSize(){RECT r{0,0,px(580),px(detailsOpen?650:410)};AdjustWindowRectEx(&r,(DWORD)GetWindowLongPtrW(mainWindow,GWL_STYLE),FALSE,0);SetWindowPos(mainWindow,nullptr,0,0,r.right-r.left,r.bottom-r.top,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);layout();InvalidateRect(mainWindow,nullptr,TRUE);}
 static void createUi(){
     sizingFields=true;ratioWidth=1113;ratioHeight=627;
-    fonts();auto icon=control(Icon,L"STATIC",L"",SS_ICON|SS_CENTERIMAGE);SendMessageW(icon,STM_SETICON,(WPARAM)LoadImageW(instance,MAKEINTRESOURCEW(101),IMAGE_ICON,px(46),px(46),LR_DEFAULTCOLOR),0);label(Header,L"鼠卫兵");SendMessageW(controls[Header],WM_SETFONT,(WPARAM)titleFont,TRUE);label(Subtitle,L"阴阳师窗口管家 · 0.3");button(Background,L"后台");button(Details,L"窗口 / 设置");button(Help,L"说明");
+    fonts();auto icon=control(Icon,L"STATIC",L"",SS_ICON|SS_CENTERIMAGE);SendMessageW(icon,STM_SETICON,(WPARAM)LoadImageW(instance,MAKEINTRESOURCEW(101),IMAGE_ICON,px(46),px(46),LR_DEFAULTCOLOR),0);label(Header,L"鼠卫兵");SendMessageW(controls[Header],WM_SETFONT,(WPARAM)titleFont,TRUE);label(Subtitle,L"阴阳师窗口管家 · 0.3.1");button(Background,L"后台");button(Details,L"窗口 / 设置");button(Help,L"说明");
     label(LPath,L"游戏");edit(Path,cfg.path);button(AutoFind,L"查找 ▾");button(Browse,L"选择");label(LArgs,L"参数");edit(Args,cfg.args);
     label(LCount,L"数量");edit(Count,std::to_wstring(cfg.count),true);label(LDelay,L"间隔 / ms");edit(Delay,std::to_wstring(cfg.delay),true);button(Launch,L"启动 / 多开");button(Cancel,L"停止");EnableWindow(controls[Cancel],FALSE);
     label(LFilter,L"进程");edit(Filter,cfg.filter);button(Refresh,L"刷新");button(Pick,L"添加窗口（3 秒）");
@@ -739,6 +756,31 @@ static bool selfTest(const S& dir){
             return sharp?line.rfind("awareness=2 ",0)==0||line.rfind("awareness=1 ",0)==0:line.rfind("awareness=0 ",0)==0;
         };
         check(runProbe(false)&&runProbe(true),"real child process uses same launch environment to switch from DPI unaware to aware");
+        S installation=dir+L"\\多开测试 带空格";CreateDirectoryW(installation.c_str(),nullptr);CreateDirectoryW((installation+L"\\bin").c_str(),nullptr);
+        unsigned char placeholder=0;atomicWrite(installation+L"\\Launch.exe",&placeholder,1);CopyFileW(probe.c_str(),(installation+L"\\bin\\onmyoji.exe").c_str(),FALSE);
+        LaunchSpec resolved;S error;bool resolvedOk=resolveLaunch(installation+L"\\Launch.exe",L"--sample \"中文参数\"",resolved,error);
+        check(resolvedOk&&resolved.directClient&&resolved.executable==installation+L"\\bin\\onmyoji.exe"&&resolved.directory==installation&&resolved.args==L"--sample \"中文参数\"","launcher resolves to independent client with root working directory and unchanged arguments");
+        LaunchSpec direct;check(resolveLaunch(installation+L"\\bin\\onmyoji.exe",L"",direct,error)&&direct.directory==installation&&direct.directClient,"explicit bin client also uses installation root as working directory");
+        CreateDirectoryW((installation+L"\\incomplete").c_str(),nullptr);atomicWrite(installation+L"\\incomplete\\Launch.exe",&placeholder,1);
+        check(!resolveLaunch(installation+L"\\incomplete\\Launch.exe",L"",direct,error)&&!error.empty(),"missing independent client rejects launch without falling back to launcher");
+        std::vector<PROCESS_INFORMATION> children;std::vector<Target> windows;bool preserved=true,rootDirectory=true;
+        // Three starts use the production spawn path; the placeholder Launch.exe cannot run.
+        for(int launch=0;launch<3;launch++){
+            S record=installation+L"\\instance-"+std::to_wstring(launch)+L".txt";DeleteFileW(record.c_str());
+            resolveLaunch(installation+L"\\Launch.exe",L"--hold \""+record+L"\"",resolved,error);PROCESS_INFORMATION child{};
+            if(!spawnClient(resolved,true,child)){preserved=false;break;}CloseHandle(child.hThread);child.hThread=nullptr;children.push_back(child);
+            std::vector<unsigned char> bytes;ULONGLONG end=GetTickCount64()+4000;bool ready=false;
+            while(GetTickCount64()<end){if(readBytes(record,bytes)&&bytes.size()>=8&&bytes.size()%2==0){ready=true;break;}if(WaitForSingleObject(child.hProcess,20)==WAIT_OBJECT_0)break;}
+            if(!ready){preserved=false;break;}S contents((const wchar_t*)bytes.data(),bytes.size()/2);auto line=contents.find(L'\n');
+            if(line==S::npos){preserved=false;break;}HWND window=(HWND)(uintptr_t)_wcstoui64(contents.c_str()+1,nullptr,10);Target target=targetOf(window);
+            if(!valid(target)||target.pid!=child.dwProcessId){preserved=false;break;}windows.push_back(target);if(contents.substr(line+1)!=installation)rootDirectory=false;
+            for(auto& previous:windows)if(!valid(previous))preserved=false;
+            for(auto& previous:children)if(WaitForSingleObject(previous.hProcess,0)!=WAIT_TIMEOUT)preserved=false;
+        }
+        check(preserved&&windows.size()==3&&windows[0].pid!=windows[1].pid&&windows[1].pid!=windows[2].pid,"three repeated independent starts keep all earlier process and window identities alive");
+        check(rootDirectory&&windows.size()==3,"all independent starts receive correct Unicode working directory");
+        for(auto& window:windows)if(valid(window))PostMessageW(window.hwnd,WM_CLOSE,0,0);
+        for(auto& child:children){if(WaitForSingleObject(child.hProcess,2000)!=WAIT_OBJECT_0)TerminateProcess(child.hProcess,1);CloseHandle(child.hProcess);}
     }
     configPath=dir+L"\\manager-settings.dat";
     bool registered=false;int testKey=VK_F6,testMods=MOD_CONTROL|MOD_ALT|MOD_SHIFT;
@@ -789,7 +831,7 @@ int WINAPI wWinMain(HINSTANCE h,HINSTANCE,LPWSTR,int show){
     instance=h;int argc=0;LPWSTR* argv=CommandLineToArgvW(GetCommandLineW(),&argc);
     bool diagnostics=false,discoverReport=false;int waitParent=0;
     for(int i=1;i<argc;i++){if(S(argv[i])==L"--self-test")testMode=true;if(S(argv[i])==L"--smoke-test")smokeMode=true;if(S(argv[i])==L"--diagnose")diagnostics=true;if(S(argv[i])==L"--discover")discoverReport=true;if(S(argv[i])==L"--wait-parent"&&i+1<argc)number(argv[++i],1,99999999,waitParent);}
-    if(discoverReport&&argc>2){S output=L"\uFEFF鼠卫兵自动读取客户端路径\r\n";for(auto& path:gameCandidates())output+=path+L"\r\n";bool ok=atomicWrite(argv[argc-1],output.data(),output.size()*2);LocalFree(argv);return ok?0:1;}
+    if(discoverReport&&argc>2){S output=L"\uFEFF鼠卫兵自动读取客户端路径与多开入口\r\n";for(auto& path:gameCandidates()){output+=path+L"\r\n";LaunchSpec plan;S error;if(resolveLaunch(path,L"",plan,error))output+=L"  实际启动="+plan.executable+L"\r\n  工作目录="+plan.directory+L"\r\n";else output+=L"  无法追加多开="+error+L"\r\n";}bool ok=atomicWrite(argv[argc-1],output.data(),output.size()*2);LocalFree(argv);return ok?0:1;}
     if(diagnostics&&argc>2){EnumWindows(enumTarget,(LPARAM)&cfg.filter);S report=L"\uFEFF鼠卫兵窗口识别诊断\r\n筛选："+cfg.filter+L"\r\n窗口数量："+std::to_wstring(targets.size())+L"\r\n";for(auto& t:targets)report+=L"PID="+std::to_wstring(t.pid)+L" | "+t.process+L" | "+t.title+L" | 身份有效="+(valid(t)?L"是":L"否")+L"\r\n"+geometryReport(t);bool ok=atomicWrite(argv[argc-1],report.data(),report.size()*sizeof(wchar_t));LocalFree(argv);return ok?0:1;}
     if(testMode){S dir=argc>2?argv[argc-1]:L".";CreateDirectoryW(dir.c_str(),nullptr);FILE* file;_wfreopen_s(&file,(dir+L"\\test-results.txt").c_str(),L"w",stdout);bool ok=selfTest(dir);fflush(stdout);LocalFree(argv);return ok?0:1;}
     LocalFree(argv);
