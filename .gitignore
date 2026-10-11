@@ -1,0 +1,8 @@
+.build/
+dist/
+*.res
+*.obj
+*.pdb
+*.tmp
+zig-cache/
+.zig-cache/
