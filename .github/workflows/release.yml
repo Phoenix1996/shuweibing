@@ -77,9 +77,16 @@ jobs:
         run: |
           set -euo pipefail
           test "$RELEASE_TAG" = "v$APP_VERSION"
-          flags=()
-          if [[ "$APP_VERSION" == 0.* ]]; then flags+=(--prerelease); fi
-          gh release create "$RELEASE_TAG" \
-            "package/鼠卫兵-$APP_VERSION-windows-x64.zip" package/SHA256SUMS.txt \
-            --verify-tag --title "鼠卫兵 $APP_VERSION" \
-            --notes-file package/RELEASE_NOTES.md "${flags[@]}"
+          if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [[ "$draft" != true ]]; then
+              echo 'Release is already published; keeping published files unchanged.'
+              exit 0
+            fi
+          else
+            gh release create "$RELEASE_TAG" --draft --verify-tag \
+              --title "鼠卫兵 $APP_VERSION" --notes-file package/RELEASE_NOTES.md
+          fi
+          gh release upload "$RELEASE_TAG" package/ShuWeiBing.exe \
+            "package/ShuWeiBing-$APP_VERSION-windows-x64.zip" package/SHA256SUMS.txt --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --latest \
+            --notes-file package/RELEASE_NOTES.md
