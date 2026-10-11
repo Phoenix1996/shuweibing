@@ -1,4 +1,4 @@
-// 鼠卫兵 0.2 — native Win32, no background service or game injection.
+// 鼠卫兵 0.2.1 — native Win32, no background service or game injection.
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -25,8 +25,8 @@
 using S = std::wstring;
 struct Settings {
     S path, args, filter=L"onmyoji;YysLauncher";
-    int width=1136, height=640, count=2, delay=1200, columns=0, opacity=100;
-    bool lockRatio=true;
+    int width=1113, height=627, count=2, delay=1200, columns=0, opacity=100;
+    bool lockRatio=true, sharpLaunch=true;
 };
 struct Target {
     HWND hwnd{}; DWORD pid{}; uint64_t born{}; S title, process;
@@ -45,7 +45,7 @@ static HBRUSH background, cardBrush;
 static std::map<HWND,bool> hover;
 static int dpi=96;
 static bool detailsOpen=false, sizingFields=false, trayReady=false;
-static int ratioWidth=1136, ratioHeight=640;
+static int ratioWidth=1113, ratioHeight=627;
 static const UINT TrayMessage=WM_APP+1;
 static UINT taskbarCreated;
 static NOTIFYICONDATAW tray{};
@@ -56,6 +56,8 @@ static std::vector<Target> targets, manualTargets;
 static std::map<HWND,Saved> saved;
 static std::map<HWND,Target> hidden;
 static std::vector<Monitor> monitors;
+struct Arrangement { std::vector<Target> rows; HMONITOR monitor{}; int ticks=0, stable=0; };
+static Arrangement arrangement;
 static int launchRemaining=0, launchTotal=0;
 static S launchPath, launchArgs;
 static std::map<int,HWND> controls;
@@ -64,7 +66,7 @@ enum {
     Pick, SelectAll, SelectNone, Width, Height, Resize, Columns, Screen, Arrange,
     Opacity, Alpha, Hide, Show, Restore, Help, List, Header, Subtitle,
     LPath, LArgs, LCount, LDelay, LFilter, LWidth, LHeight, LColumns, LScreen,
-    LOpacity, LWindows, Hint, Icon, Details, LockRatio, Background
+    LOpacity, LWindows, Hint, Icon, Details, LockRatio, Background, SharpLaunch
 };
 static int px(int n){return MulDiv(n,dpi,96);}
 static S text(HWND w){int n=GetWindowTextLengthW(w); S s(n+1,L'\0');GetWindowTextW(w,s.data(),n+1);s.resize(n);return s;}
@@ -102,6 +104,7 @@ static std::vector<unsigned char> encode(const Settings& c){
     s+=L"width="+std::to_wstring(c.width)+L"\nheight="+std::to_wstring(c.height)+L"\ncount="+std::to_wstring(c.count);
     s+=L"\ndelay="+std::to_wstring(c.delay)+L"\ncolumns="+std::to_wstring(c.columns)+L"\nopacity="+std::to_wstring(c.opacity)+L"\n";
     s+=L"lockRatio="+S(c.lockRatio?L"1":L"0")+L"\n";
+    s+=L"sharpLaunch="+S(c.sharpLaunch?L"1":L"0")+L"\n";
     uint64_t check=hash(s.data(),s.size()*sizeof(wchar_t));
     std::vector<unsigned char> b(8+s.size()*sizeof(wchar_t));memcpy(b.data(),&check,8);memcpy(b.data()+8,s.data(),s.size()*sizeof(wchar_t));return b;
 }
@@ -113,11 +116,13 @@ static bool decode(const std::vector<unsigned char>& b,Settings& c){
     std::map<S,S> kv;size_t at=magic.size();
     while(at<s.size()){size_t end=s.find(L'\n',at);if(end==S::npos)return false;size_t eq=s.find(L'=',at);if(eq==S::npos||eq>=end)return false;S key=s.substr(at,eq-at);if(kv.count(key))return false;kv[key]=s.substr(eq+1,end-eq-1);at=end+1;}
     Settings candidate;
-    if((kv.size()!=9&&kv.size()!=10)||!kv.count(L"path")||!kv.count(L"args")||!kv.count(L"filter")||(kv.size()==10&&!kv.count(L"lockRatio")))return false;
+    if(kv.size()<9||kv.size()>11||!kv.count(L"path")||!kv.count(L"args")||!kv.count(L"filter"))return false;
+    for(auto& [key,value]:kv)if(key!=L"path"&&key!=L"args"&&key!=L"filter"&&key!=L"width"&&key!=L"height"&&key!=L"count"&&key!=L"delay"&&key!=L"columns"&&key!=L"opacity"&&key!=L"lockRatio"&&key!=L"sharpLaunch")return false;
     candidate.path=kv[L"path"];candidate.args=kv[L"args"];candidate.filter=kv[L"filter"];
     if(candidate.path.size()>32000||candidate.args.size()>4096||candidate.filter.empty()||candidate.filter.size()>256)return false;
     if(!number(kv[L"width"],160,7680,candidate.width)||!number(kv[L"height"],120,4320,candidate.height)||!number(kv[L"count"],1,20,candidate.count)||!number(kv[L"delay"],500,10000,candidate.delay)||!number(kv[L"columns"],0,20,candidate.columns)||!number(kv[L"opacity"],20,100,candidate.opacity))return false;
     if(kv.count(L"lockRatio")){int lock;if(!number(kv[L"lockRatio"],0,1,lock))return false;candidate.lockRatio=lock!=0;}
+    if(kv.count(L"sharpLaunch")){int sharp;if(!number(kv[L"sharpLaunch"],0,1,sharp))return false;candidate.sharpLaunch=sharp!=0;}
     c=candidate;return true;
 }
 static bool loadSettings(const S& p,Settings& c,int& source){
@@ -194,6 +199,7 @@ static S winError(DWORD error){
 static bool collect(Settings& c,bool notify=true){
     c=cfg;c.path=value(Path);c.args=value(Args);c.filter=value(Filter);
     c.columns=0;c.lockRatio=SendMessageW(controls[LockRatio],BM_GETCHECK,0,0)==BST_CHECKED;
+    c.sharpLaunch=SendMessageW(controls[SharpLaunch],BM_GETCHECK,0,0)==BST_CHECKED;
     bool ok=!c.filter.empty()&&c.filter.size()<=256&&c.args.size()<=4096&&number(value(Width),160,7680,c.width)&&number(value(Height),120,4320,c.height)&&number(value(Count),1,20,c.count)&&number(value(Delay),500,10000,c.delay)&&number(value(Opacity),20,100,c.opacity);
     if(!ok&&notify)MessageBoxW(mainWindow,L"请检查输入：宽 160–7680，高 120–4320；启动数量 1–20；间隔 500–10000 毫秒；不透明度 20–100%。筛选词不可为空。",L"鼠卫兵 · 输入检查",MB_OK|MB_ICONINFORMATION);return ok;
 }
@@ -209,6 +215,48 @@ static std::vector<Cell> stackRight(const std::vector<SIZE>& sizes,RECT work){
         if(right-size.cx<work.left)return {};
         cells.push_back({right-size.cx,y,(int)size.cx,(int)size.cy});y+=size.cy+gap;columnWidth=std::max(columnWidth,(int)size.cx);
     }return cells;
+}
+static void stopArrangement(){
+    KillTimer(mainWindow,4);arrangement={};
+    if(controls.count(Arrange))EnableWindow(controls[Arrange],TRUE);
+}
+static bool beginArrangement(const std::vector<Target>& rows,HMONITOR monitor){
+    if(!arrangement.rows.empty())return false;
+    for(auto& t:rows)if(!valid(t)||!capture(t)){status(L"窗口已关闭或无法读取，取消排列。");return false;}
+    arrangement.rows=rows;arrangement.monitor=monitor;
+    // Restore first, then measure after the target has handled the asynchronous request.
+    for(auto& t:rows)if(IsIconic(t.hwnd)||IsZoomed(t.hwnd))ShowWindowAsync(t.hwnd,SW_RESTORE);
+    EnableWindow(controls[Arrange],FALSE);SetTimer(mainWindow,4,150,nullptr);
+    status(L"正在排列 · 保持窗口当前大小…");return true;
+}
+static void arrangementTick(){
+    if(arrangement.rows.empty()){stopArrangement();return;}
+    if(++arrangement.ticks>12){stopArrangement();status(L"窗口位置未稳定；客户端可能限制移动，请使用窗口模式后重试。");return;}
+    MONITORINFO info{sizeof(info)};
+    if(!GetMonitorInfoW(arrangement.monitor,&info)){stopArrangement();status(L"所选屏幕已断开，请重新选择。");return;}
+    std::vector<RECT> rects;std::vector<SIZE> sizes;
+    for(auto& t:arrangement.rows){
+        RECT r{};
+        if(!valid(t)||!GetWindowRect(t.hwnd,&r)){stopArrangement();status(L"窗口已关闭或无法读取，取消排列。");return;}
+        if(IsIconic(t.hwnd)||IsZoomed(t.hwnd))return;
+        rects.push_back(r);sizes.push_back({r.right-r.left,r.bottom-r.top});
+    }
+    // Use measured outer bounds, including the game's own frame, in screen pixels.
+    auto cells=stackRight(sizes,info.rcWork);
+    if(cells.size()!=arrangement.rows.size()){stopArrangement();status(L"当前窗口大小无法全部放入屏幕；请先应用较小尺寸或减少选择。");return;}
+    bool settled=true;
+    for(size_t k=0;k<cells.size();k++){
+        auto& cell=cells[k];auto& r=rects[k];auto& t=arrangement.rows[k];
+        if(r.left==cell.x&&r.top==cell.y)continue;
+        settled=false;SetLastError(0);
+        // Arrangement must never request a resize, including on repeated clicks.
+        if(!SetWindowPos(t.hwnd,nullptr,cell.x,cell.y,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_ASYNCWINDOWPOS)){
+            DWORD error=GetLastError();stopArrangement();status(L"排列失败。"+winError(error));return;
+        }
+        saved[t.hwnd].resized=true;
+    }
+    arrangement.stable=settled?arrangement.stable+1:0;
+    if(arrangement.stable>=2){int count=(int)arrangement.rows.size();stopArrangement();status(L"右侧纵向排列完成 · "+std::to_wstring(count)+L" 个窗口，保持当前大小。");refresh();}
 }
 static int pairedDimension(int n,int from,int to){return (int)(((int64_t)n*to+from/2)/from);}
 static void sizeChanged(int id){
@@ -242,12 +290,12 @@ static bool transparency(const Target& t,int percent){
 }
 static void report(const S& action,int ok,int total,DWORD error=0){status(action+L"：成功 "+std::to_wstring(ok)+L" / "+std::to_wstring(total)+(ok<total?L"。"+winError(error):L"。"));}
 static void operate(int action){
+    if(action==Arrange&&!arrangement.rows.empty())return;
+    if(action!=Arrange)stopArrangement();
     refresh();auto rows=selected();if(rows.empty()){status(L"未选中游戏窗口；可展开窗口选择或手动添加。");return;}
     Settings c;if(!collect(c))return;cfg=c;int ok=0;DWORD error=0;
-    if(action==Arrange){int i=(int)SendMessageW(controls[Screen],CB_GETCURSEL,0,0);if(i<0||i>=(int)monitors.size()){status(L"请先选择有效屏幕。");return;}std::vector<SIZE> sizes;for(auto& t:rows)sizes.push_back(outerSize(t,c.width,c.height));auto cells=stackRight(sizes,monitors[i].work);if(cells.size()!=rows.size()){status(L"当前尺寸无法全部放入屏幕，请调小尺寸或减少选择。");return;}
-        for(size_t k=0;k<rows.size();k++){auto& t=rows[k];if(!capture(t))continue;if(IsIconic(t.hwnd)||IsZoomed(t.hwnd))ShowWindowAsync(t.hwnd,SW_RESTORE);
-            bool good=SetWindowPos(t.hwnd,nullptr,cells[k].x,cells[k].y,cells[k].w,cells[k].h,SWP_NOZORDER|SWP_NOACTIVATE|SWP_ASYNCWINDOWPOS)!=0;if(good){saved[t.hwnd].resized=true;ok++;}else error=GetLastError();}
-        report(L"右侧纵向排列（保持设定尺寸）",ok,(int)rows.size(),error);
+    if(action==Arrange){int i=(int)SendMessageW(controls[Screen],CB_GETCURSEL,0,0);if(i<0||i>=(int)monitors.size()){status(L"请先选择有效屏幕。");return;}
+        beginArrangement(rows,monitors[i].handle);
     }else if(action==Hide){
         auto previous=hidden;for(auto& t:rows)if(IsWindowVisible(t.hwnd))hidden[t.hwnd]=t;
         // Journal identities before hiding so a process crash remains recoverable.
@@ -267,11 +315,34 @@ static void operate(int action){
     }
     persist();SetTimer(mainWindow,3,350,nullptr);
 }
+static S sharpCompatibility(const S& previous){
+    S result;size_t at=0;
+    while(at<previous.size()){
+        while(at<previous.size()&&iswspace(previous[at]))at++;
+        size_t end=at;while(end<previous.size()&&!iswspace(previous[end]))end++;
+        S token=previous.substr(at,end-at),key=lower(token);
+        if(!token.empty()&&key!=L"~"&&key!=L"dpiaware"&&key!=L"dpiunaware"&&key!=L"gdidpiscaling"&&key!=L"highdpiaware")result+=token+L" ";
+        at=end;
+    }
+    return result+L"HIGHDPIAWARE";
+}
+static std::vector<wchar_t> launchEnvironment(bool sharp){
+    LPWCH raw=GetEnvironmentStringsW();if(!raw)return {};
+    std::vector<S> entries;S previous;
+    for(auto p=raw;*p;p+=wcslen(p)+1){S entry=p;if(sharp&&lower(entry).rfind(L"__compat_layer=",0)==0)previous=entry.substr(15);else entries.push_back(entry);}
+    FreeEnvironmentStringsW(raw);
+    if(sharp)entries.push_back(L"__COMPAT_LAYER="+sharpCompatibility(previous));
+    std::sort(entries.begin(),entries.end(),[](const S& a,const S& b){return CompareStringOrdinal(a.c_str(),-1,b.c_str(),-1,TRUE)==CSTR_LESS_THAN;});
+    std::vector<wchar_t> block;for(auto& entry:entries){block.insert(block.end(),entry.begin(),entry.end());block.push_back(0);}block.push_back(0);if(block.size()==1)block.push_back(0);return block;
+}
 static void launchOne(){
     if(launchRemaining<=0)return;
     S command=L"\""+launchPath+L"\""+(launchArgs.empty()?L"":L" "+launchArgs);std::vector<wchar_t> buffer(command.begin(),command.end());buffer.push_back(0);
     STARTUPINFOW si{};si.cb=sizeof(si);PROCESS_INFORMATION pi{};S cwd=folderOf(launchPath);
-    if(!CreateProcessW(launchPath.c_str(),buffer.data(),nullptr,nullptr,FALSE,0,nullptr,cwd.empty()?nullptr:cwd.c_str(),&si,&pi)){
+    auto environment=launchEnvironment(cfg.sharpLaunch);
+    if(environment.empty()){status(L"无法读取启动环境，已停止启动队列。");launchRemaining=0;KillTimer(mainWindow,1);EnableWindow(controls[Launch],TRUE);EnableWindow(controls[Cancel],FALSE);return;}
+    // A private child environment avoids persistent registry or global environment changes.
+    if(!CreateProcessW(launchPath.c_str(),buffer.data(),nullptr,nullptr,FALSE,CREATE_UNICODE_ENVIRONMENT,environment.data(),cwd.empty()?nullptr:cwd.c_str(),&si,&pi)){
         DWORD e=GetLastError();launchRemaining=0;KillTimer(mainWindow,1);EnableWindow(controls[Launch],TRUE);EnableWindow(controls[Cancel],FALSE);status(L"启动失败。"+winError(e)+(e==ERROR_ELEVATION_REQUIRED?L"该启动器要求管理员权限，可手动打开后再管理窗口。":L""));return;
     }
     CloseHandle(pi.hThread);CloseHandle(pi.hProcess);launchRemaining--;status(L"已启动 "+std::to_wstring(launchTotal-launchRemaining)+L" / "+std::to_wstring(launchTotal)+L"。实际多开取决于游戏客户端是否允许多个实例。");
@@ -332,23 +403,24 @@ static void layout(){
     place(LWidth,24,223,28,20);place(Width,56,217,72,28);place(LHeight,139,223,24,20);place(Height,169,217,72,28);place(LockRatio,254,222,108,24);place(Resize,W-150,216,126,32);
     place(LScreen,24,265,32,20);place(Screen,60,258,W-294,200);place(Arrange,W-218,256,194,34);
     place(LOpacity,24,309,88,20);place(Opacity,116,301,57,28);place(Alpha,182,299,76,32);place(Hide,W-281,299,63,32);place(Show,W-210,299,63,32);place(Restore,W-139,299,115,32);
-    for(int id:{LArgs,Args,LFilter,Filter,Pick,SelectAll,SelectNone,List})ShowWindow(controls[id],detailsOpen?SW_SHOW:SW_HIDE);
+    for(int id:{LArgs,Args,LFilter,Filter,Pick,SelectAll,SelectNone,List,SharpLaunch})ShowWindow(controls[id],detailsOpen?SW_SHOW:SW_HIDE);
     if(detailsOpen){
         place(LFilter,24,368,56,20);place(Filter,84,362,W-260,28);place(Pick,W-168,362,144,28);
         place(LArgs,24,407,56,20);place(Args,84,401,W-108,28);
-        place(SelectAll,W-159,436,63,26);place(SelectNone,W-88,436,64,26);place(List,24,468,space,std::max(60,H-548));
+        place(SharpLaunch,24,438,380,24);place(SelectAll,W-159,436,63,26);place(SelectNone,W-88,436,64,26);place(List,24,468,space,std::max(60,H-548));
     }
     place(Hint,24,H-55,space,20);MoveWindow(statusWindow,px(24),r.bottom-px(31),r.right-px(48),px(20),TRUE);
     if(listWindow){int widths[]={space-280,110,70,100};for(int i=0;i<4;i++)ListView_SetColumnWidth(listWindow,i,px(widths[i]));}
 }
 static void panelSize(){RECT r{0,0,px(580),px(detailsOpen?650:410)};AdjustWindowRectEx(&r,(DWORD)GetWindowLongPtrW(mainWindow,GWL_STYLE),FALSE,0);SetWindowPos(mainWindow,nullptr,0,0,r.right-r.left,r.bottom-r.top,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);layout();InvalidateRect(mainWindow,nullptr,TRUE);}
 static void createUi(){
-    sizingFields=true;ratioWidth=cfg.width;ratioHeight=cfg.height;
-    fonts();auto icon=control(Icon,L"STATIC",L"",SS_ICON|SS_CENTERIMAGE);SendMessageW(icon,STM_SETICON,(WPARAM)LoadImageW(instance,MAKEINTRESOURCEW(101),IMAGE_ICON,px(46),px(46),LR_DEFAULTCOLOR),0);label(Header,L"鼠卫兵");SendMessageW(controls[Header],WM_SETFONT,(WPARAM)titleFont,TRUE);label(Subtitle,L"阴阳师窗口管家 · 0.2");button(Background,L"后台");button(Details,L"窗口 / 设置");button(Help,L"说明");
+    sizingFields=true;ratioWidth=1113;ratioHeight=627;
+    fonts();auto icon=control(Icon,L"STATIC",L"",SS_ICON|SS_CENTERIMAGE);SendMessageW(icon,STM_SETICON,(WPARAM)LoadImageW(instance,MAKEINTRESOURCEW(101),IMAGE_ICON,px(46),px(46),LR_DEFAULTCOLOR),0);label(Header,L"鼠卫兵");SendMessageW(controls[Header],WM_SETFONT,(WPARAM)titleFont,TRUE);label(Subtitle,L"阴阳师窗口管家 · 0.2.1");button(Background,L"后台");button(Details,L"窗口 / 设置");button(Help,L"说明");
     label(LPath,L"游戏");edit(Path,cfg.path);button(Browse,L"选择");label(LArgs,L"参数");edit(Args,cfg.args);
     label(LCount,L"数量");edit(Count,std::to_wstring(cfg.count),true);label(LDelay,L"间隔 / ms");edit(Delay,std::to_wstring(cfg.delay),true);button(Launch,L"启动 / 多开");button(Cancel,L"停止");EnableWindow(controls[Cancel],FALSE);
     label(LFilter,L"进程");edit(Filter,cfg.filter);button(Refresh,L"刷新");button(Pick,L"添加窗口（3 秒）");
     label(LWindows,L"游戏窗口");button(SelectAll,L"全选");button(SelectNone,L"全不选");
+    control(SharpLaunch,L"BUTTON",L"清晰启动 · 避免系统拉伸（新启动生效）",WS_TABSTOP|BS_AUTOCHECKBOX);SendMessageW(controls[SharpLaunch],BM_SETCHECK,cfg.sharpLaunch?BST_CHECKED:BST_UNCHECKED,0);
     listWindow=control(List,WC_LISTVIEWW,L"",WS_TABSTOP|LVS_REPORT|LVS_SHOWSELALWAYS,WS_EX_CLIENTEDGE);
     SetWindowTheme(listWindow,L"Explorer",nullptr);
     ListView_SetExtendedListViewStyle(listWindow,LVS_EX_CHECKBOXES|LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER);
@@ -356,7 +428,7 @@ static void createUi(){
     label(LWidth,L"宽");edit(Width,std::to_wstring(cfg.width),true);label(LHeight,L"高");edit(Height,std::to_wstring(cfg.height),true);control(LockRatio,L"BUTTON",L"锁定比例",WS_TABSTOP|BS_AUTOCHECKBOX);SendMessageW(controls[LockRatio],BM_SETCHECK,cfg.lockRatio?BST_CHECKED:BST_UNCHECKED,0);button(Resize,L"应用尺寸");
     label(LScreen,L"屏幕");control(Screen,L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL);
     button(Arrange,L"自动排列 · 右侧纵向");label(LOpacity,L"不透明度 %");edit(Opacity,std::to_wstring(cfg.opacity),true);button(Alpha,L"应用");button(Hide,L"隐藏");button(Show,L"显示");button(Restore,L"恢复布局");
-    label(Hint,L"右侧向下，排满向左 · 排列保持设定尺寸");
+    label(Hint,L"右侧向下，排满向左 · 排列只移动，尺寸单独应用");
     statusWindow=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_LEFT|SS_ENDELLIPSIS,0,0,0,0,mainWindow,nullptr,instance,nullptr);SendMessageW(statusWindow,WM_SETFONT,(WPARAM)bodyFont,TRUE);
     sizingFields=false;screens();layout();refresh();status(L"就绪 · 默认选择全部游戏窗口");
 }
@@ -375,7 +447,7 @@ static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
     case WM_SIZE:if(wp==SIZE_MINIMIZED&&trayReady){ShowWindow(w,SW_HIDE);return 0;}if(statusWindow&&wp!=SIZE_MINIMIZED){layout();InvalidateRect(w,nullptr,TRUE);}return 0;
     case WM_GETMINMAXINFO:{auto p=(MINMAXINFO*)lp;RECT r{0,0,px(580),px(detailsOpen?650:410)};AdjustWindowRectEx(&r,WS_OVERLAPPEDWINDOW,FALSE,0);p->ptMinTrackSize={r.right-r.left,r.bottom-r.top};return 0;}
     case WM_DPICHANGED:{dpi=HIWORD(wp);fonts();auto r=(RECT*)lp;SetWindowPos(w,nullptr,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOZORDER|SWP_NOACTIVATE);layout();return 0;}
-    case WM_DISPLAYCHANGE:screens();return 0;
+    case WM_DISPLAYCHANGE:stopArrangement();screens();return 0;
     case WM_PAINT:{PAINTSTRUCT p;HDC dc=BeginPaint(w,&p);RECT r;GetClientRect(w,&r);FillRect(dc,&r,background);auto old=SelectObject(dc,cardBrush);auto pen=CreatePen(PS_SOLID,1,RGB(226,232,239));auto oldPen=SelectObject(dc,pen);RoundRect(dc,px(12),px(68),r.right-px(12),px(160),px(14),px(14));RoundRect(dc,px(12),px(170),r.right-px(12),px(342),px(14),px(14));if(detailsOpen)RoundRect(dc,px(12),px(350),r.right-px(12),r.bottom-px(70),px(14),px(14));SelectObject(dc,old);SelectObject(dc,oldPen);DeleteObject(pen);EndPaint(w,&p);return 0;}
     case WM_DRAWITEM:drawButton((DRAWITEMSTRUCT*)lp);return TRUE;
     case WM_CTLCOLORSTATIC:{HDC dc=(HDC)wp;SetBkMode(dc,TRANSPARENT);SetTextColor(dc,(HWND)lp==controls[Header]?RGB(35,58,100):RGB(64,76,93));bool head=(HWND)lp==controls[Header]||(HWND)lp==controls[Subtitle]||(HWND)lp==controls[Icon]||(HWND)lp==controls[Hint]||(HWND)lp==statusWindow;return (LRESULT)(head?background:cardBrush);}
@@ -385,27 +457,40 @@ static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
         case Browse:browse();break;case Refresh:refresh();persist();status(L"游戏窗口已刷新。");break;
         case Details:detailsOpen=!detailsOpen;set(Details,detailsOpen?L"收起设置":L"窗口 / 设置");panelSize();break;
         case Background:if(trayReady||addTray())ShowWindow(w,SW_MINIMIZE);else status(L"托盘暂时不可用，可用任务栏最小化。");break;
+        case SharpLaunch:persist();status(L"启动选项已保存；下次启动游戏时生效。");break;
         case LockRatio:if(SendMessageW(controls[LockRatio],BM_GETCHECK,0,0)==BST_CHECKED){int a,b;if(number(value(Width),160,7680,a)&&number(value(Height),120,4320,b)){ratioWidth=a;ratioHeight=b;}}break;
         case SelectAll:case SelectNone:for(int i=0;i<ListView_GetItemCount(listWindow);i++)ListView_SetCheckState(listWindow,i,LOWORD(wp)==SelectAll);break;
         case Launch:beginLaunch();break;case Cancel:KillTimer(w,1);launchRemaining=0;EnableWindow(controls[Launch],TRUE);EnableWindow(controls[Cancel],FALSE);status(L"启动队列已停止；已启动的游戏继续运行。");break;
         case Pick:EnableWindow(controls[Pick],FALSE);SetTimer(w,2,3000,nullptr);status(L"请在 3 秒内切换到要管理的游戏窗口。");break;
         case Resize:case Arrange:case Alpha:case Hide:case Show:case Restore:operate(LOWORD(wp));break;
-        case Help:MessageBoxW(w,L"默认选择全部游戏窗口，直接使用常用操作即可。\n“窗口 / 设置”可展开窗口选择、进程筛选与启动参数。\n\n锁定比例：修改宽或高，另一个数值自动跟随；取消锁定后可自定义比例，再勾选锁定。\n自动排列：从屏幕右上角向下排，纵向放不下时向左增加一列。保持填写的尺寸，不自动放大或缩小；整屏放不下时会提示调小尺寸。\n\n最小化或“后台”进入托盘，双击托盘图标或右键“打开”恢复。右键“退出”或窗口关闭按钮真正退出，显示本程序隐藏的游戏窗口。\n\n“恢复布局”恢复本次会话首次修改前的布局与透明度。多开仍受客户端实例限制；建议游戏使用窗口模式。",L"鼠卫兵 · 使用说明",MB_OK|MB_ICONINFORMATION);break;
+        case Help:MessageBoxW(w,L"默认选择全部游戏窗口，直接使用常用操作即可。\n“窗口 / 设置”可展开窗口选择、进程筛选与启动参数。\n\n默认比例 1113:627（约 16:9），例如宽 980 时高为 552。修改宽或高，另一项自动跟随。取消锁定后可自定义比例，再勾选锁定。点击“应用尺寸”调整游戏内容区。\n自动排列：从屏幕右上角向下排，纵向放不下时向左增加一列。只移动，保持窗口当前大小；整屏放不下时会提示先调小尺寸。\n\n最小化或“后台”进入托盘，双击托盘图标或右键“打开”恢复。右键“退出”或窗口关闭按钮真正退出，显示本程序隐藏的游戏窗口。\n\n“恢复布局”恢复本次会话首次修改前的布局与透明度。多开仍受客户端实例限制；建议游戏使用窗口模式。",L"鼠卫兵 · 使用说明",MB_OK|MB_ICONINFORMATION);break;
         }return 0;
     case WM_TIMER:switch(wp){
         case 1:launchOne();break;
         case 2:{KillTimer(w,2);EnableWindow(controls[Pick],TRUE);HWND fg=GetForegroundWindow();Target t=targetOf(fg);if(fg&&fg!=w&&t.pid!=GetCurrentProcessId()&&valid(t)&&!t.title.empty()){manualTargets.push_back(t);refresh();status(L"已添加窗口："+t.title);}else status(L"没有选到有效窗口，请重试并切换到游戏。");break;}
         case 3:KillTimer(w,3);for(auto i=hidden.begin();i!=hidden.end();){if(!valid(i->second)||IsWindowVisible(i->first))i=hidden.erase(i);else ++i;}saveHidden();refresh();break;
+        case 4:arrangementTick();break;
         case 9:KillTimer(w,9);DestroyWindow(w);break;
         }return 0;
-    case WM_CLOSE:persist();restoreHidden();DestroyWindow(w);return 0;
+    case WM_CLOSE:stopArrangement();persist();restoreHidden();DestroyWindow(w);return 0;
     case WM_DESTROY:if(trayReady)Shell_NotifyIconW(NIM_DELETE,&tray);trayReady=false;PostQuitMessage(0);return 0;
     }return DefWindowProcW(w,msg,wp,lp);
 }
 static bool selfTest(const S& dir){
     CreateDirectoryW(dir.c_str(),nullptr);int failed=0,count=0;auto check=[&](bool ok,const char* name){count++;printf("%s %s\n",ok?"PASS":"FAIL",name);if(!ok)failed++;};
     Settings a;a.path=L"C:\\游戏目录\\Launch.exe";a.args=L"--name \"中文账户\"";auto b=encode(a);Settings c;
-    check(decode(b,c)&&c.path==a.path&&c.args==a.args&&c.width==1136,"unicode settings round trip");
+    check(decode(b,c)&&c.path==a.path&&c.args==a.args&&c.width==1113&&c.height==627,"unicode settings round trip");
+    auto legacy=[&](bool withRatio){
+        S data((const wchar_t*)(b.data()+8),(b.size()-8)/2);
+        for(auto line:{L"sharpLaunch=1\n",withRatio?L"":L"lockRatio=1\n"}){if(!*line)continue;auto pos=data.find(line);if(pos!=S::npos)data.erase(pos,wcslen(line));}
+        std::vector<unsigned char> bytes(8+data.size()*2);auto checkSum=hash(data.data(),data.size()*2);memcpy(bytes.data(),&checkSum,8);memcpy(bytes.data()+8,data.data(),data.size()*2);return bytes;
+    };
+    check(decode(legacy(false),c)&&c.lockRatio&&c.sharpLaunch&&decode(legacy(true),c)&&c.sharpLaunch,"older nine and ten field settings retain launch compatibility");
+    auto launchSettings=a;launchSettings.sharpLaunch=false;check(decode(encode(launchSettings),c)&&!c.sharpLaunch,"sharp launch preference round trip");
+    check(sharpCompatibility(L"~ RUNASADMIN DPIUNAWARE GdiDpiScaling HighDpiAware")==L"RUNASADMIN HIGHDPIAWARE","sharp launch replaces conflicting DPI flags and preserves other compatibility flags");
+    auto launchEnv=launchEnvironment(true);bool envGood=launchEnv.size()>2&&launchEnv[launchEnv.size()-1]==0&&launchEnv[launchEnv.size()-2]==0;int layers=0;
+    for(auto p=launchEnv.data();envGood&&*p;p+=wcslen(p)+1)if(lower(p).rfind(L"__compat_layer=",0)==0){layers++;if(S(p).find(L"HIGHDPIAWARE")==S::npos)envGood=false;}
+    check(envGood&&layers==1,"private Unicode launch environment has exactly one DPI override and double terminator");
     auto damaged=b;damaged.back()^=0x55;check(!decode(damaged,c),"checksum rejects corruption");
     check(!decode(std::vector<unsigned char>(182,0),c),"zero-filled settings rejected");
     check(!decode(std::vector<unsigned char>(1,0),c),"truncated settings rejected");
@@ -413,7 +498,7 @@ static bool selfTest(const S& dir){
     S p=dir+L"\\test-settings.dat";DeleteFileW(p.c_str());DeleteFileW((p+L".bak").c_str());
     check(saveSettings(p,a),"atomic first save");a.width=1200;check(saveSettings(p,a),"atomic subsequent save and backup");int source;
     check(loadSettings(p,c,source)&&source==0&&c.width==1200,"load current settings");
-    unsigned char zero[182]{};atomicWrite(p,zero,sizeof(zero));check(loadSettings(p,c,source)&&source==1&&c.width==1136,"corruption recovers valid backup");
+    unsigned char zero[182]{};atomicWrite(p,zero,sizeof(zero));check(loadSettings(p,c,source)&&source==1&&c.width==1113,"corruption recovers valid backup");
     atomicWrite(p+L".bak",zero,sizeof(zero));check(!loadSettings(p,c,source)&&source==2,"both corrupt returns defaults path");
     bool fits=true;for(int n=1;n<=20;n++){RECT work{-1920,-200,0,880};auto cells=stackRight(std::vector<SIZE>(n,{240,160}),work);if(cells.size()!=(size_t)n){fits=false;break;}for(auto cell:cells)if(cell.x<work.left||cell.y<work.top||cell.x+cell.w>work.right||cell.y+cell.h>work.bottom||cell.w!=240||cell.h!=160)fits=false;}
     check(fits,"right stack fits 1-20 windows without resizing, negative origin");
@@ -422,7 +507,7 @@ static bool selfTest(const S& dir){
     auto edge=stackRight(std::vector<SIZE>(3,{320,240}),{0,0,1000,488});check(edge.size()==3&&edge[1].y==248&&edge[2].y==0&&edge[2].x<edge[1].x,"exact vertical fit includes gap");
     check(stackRight(std::vector<SIZE>(2,{320,240}),{0,0,400,400}).empty(),"screen overflow rejected without shrinking");
     auto mixed=stackRight({{300,240},{320,240},{280,300}},{-1000,-200,0,300});check(mixed.size()==3&&mixed[0].x+mixed[0].w==0&&mixed[1].x+mixed[1].w==0&&mixed[2].x+mixed[2].w==-328,"different border widths right-aligned and separate columns");
-    check(pairedDimension(568,1136,640)==320&&pairedDimension(320,640,1136)==568,"aspect ratio counterpart rounding");
+    check(pairedDimension(980,1113,627)==552&&pairedDimension(552,627,1113)==980,"game default aspect ratio counterpart rounding");
     int n=0;check(!number(L"99999999",1,20,n)&&!number(L"-1",1,20,n)&&number(L"20",1,20,n),"numeric boundaries");
     check(matches(L"阴阳师-网易游戏",L"onmyoji.exe",L"onmyoji;YysLauncher")&&!matches(L"yys 阴阳师攻略",L"msedge.exe",L"onmyoji;YysLauncher"),"process filters exclude browser title matches");
     // Integration uses only our own synthetic window, never the user's programs.
@@ -438,17 +523,71 @@ static bool selfTest(const S& dir){
     HWND panel=CreateWindowExW(0,wc.lpszClassName,L"SWB Test Panel",WS_OVERLAPPEDWINDOW,0,0,600,450,nullptr,nullptr,instance,nullptr);panelSize();RECT client{};GetClientRect(panel,&client);
     check(panel&&client.right==px(580)&&client.bottom==px(410)&&!(GetWindowLongPtrW(listWindow,GWL_STYLE)&WS_VISIBLE),"compact panel size and collapsed list");
     RECT footer{};GetWindowRect(statusWindow,&footer);MapWindowPoints(nullptr,panel,(POINT*)&footer,2);check(footer.left==px(24)&&footer.right==client.right-px(24)&&footer.bottom<=client.bottom-px(10),"footer horizontal and bottom padding");
-    set(Width,L"568");check(value(Height)==L"320","editing width follows locked aspect ratio");set(Height,L"160");check(value(Width)==L"284","editing height follows locked aspect ratio");
-    SendMessageW(controls[LockRatio],BM_SETCHECK,BST_UNCHECKED,0);set(Width,L"500");check(value(Height)==L"160","unlocked dimensions can be edited independently");
-    SendMessageW(controls[LockRatio],BM_SETCHECK,BST_CHECKED,0);set(Width,L"7680");Settings oversized;check(value(Height)==std::to_wstring(pairedDimension(7680,1136,640))&&!collect(oversized,false),"locked ratio exceeding supported bounds is rejected");set(Width,L"568");
+    set(Width,L"980");check(value(Height)==L"552","editing width follows game default aspect ratio");set(Height,L"627");check(value(Width)==L"1113","editing height follows game default aspect ratio");
+    SendMessageW(controls[LockRatio],BM_SETCHECK,BST_UNCHECKED,0);set(Width,L"500");check(value(Height)==L"627","unlocked dimensions can be edited independently");
+    SendMessageW(controls[LockRatio],BM_SETCHECK,BST_CHECKED,0);set(Width,L"7680");Settings oversized;check(value(Height)==std::to_wstring(pairedDimension(7680,1113,627))&&!collect(oversized,false),"locked ratio exceeding supported bounds is rejected");set(Width,L"980");
+    // Exercise the same measured geometry and move-only path used by the Arrange button.
+    auto monitor=MonitorFromWindow(panel,MONITOR_DEFAULTTONEAREST);MONITORINFO mi{sizeof(mi)};GetMonitorInfoW(monitor,&mi);
+    HWND one=CreateWindowExW(0,L"STATIC",L"Arrange Test 1",WS_OVERLAPPEDWINDOW,mi.rcWork.right+100,mi.rcWork.top,300,180,nullptr,nullptr,instance,nullptr);
+    HWND two=CreateWindowExW(WS_EX_CLIENTEDGE,L"STATIC",L"Arrange Test 2",WS_OVERLAPPEDWINDOW,mi.rcWork.right+100,mi.rcWork.top,320,180,nullptr,nullptr,instance,nullptr);
+    std::vector<Target> rows{targetOf(one),targetOf(two)};RECT beforeOne{},beforeTwo{},afterOne{},afterTwo{};
+    GetWindowRect(one,&beforeOne);GetWindowRect(two,&beforeTwo);
+    bool began=beginArrangement(rows,monitor),duplicate=!beginArrangement(rows,monitor);for(int i=0;i<8&&!arrangement.rows.empty();i++)arrangementTick();
+    GetWindowRect(one,&afterOne);GetWindowRect(two,&afterTwo);
+    check(began&&duplicate&&arrangement.rows.empty()&&IsWindowEnabled(controls[Arrange]),"arrange coalesces duplicate requests and completes");
+    check(afterOne.right==mi.rcWork.right&&afterTwo.right==mi.rcWork.right&&afterOne.top==mi.rcWork.top&&afterTwo.top==afterOne.bottom+8,"native actual window bounds align at right edge without overflow");
+    bool stable=true;for(int repeat=0;repeat<10;repeat++){
+        beginArrangement(rows,monitor);for(int i=0;i<8&&!arrangement.rows.empty();i++)arrangementTick();
+        RECT r1{},r2{};GetWindowRect(one,&r1);GetWindowRect(two,&r2);
+        if(!EqualRect(&r1,&afterOne)||!EqualRect(&r2,&afterTwo))stable=false;
+    }
+    check(stable&&afterOne.right-afterOne.left==beforeOne.right-beforeOne.left&&afterOne.bottom-afterOne.top==beforeOne.bottom-beforeOne.top&&afterTwo.right-afterTwo.left==beforeTwo.right-beforeTwo.left&&afterTwo.bottom-afterTwo.top==beforeTwo.bottom-beforeTwo.top,"ten repeated arrangements preserve exact size and position despite different input dimensions");
+    SetWindowPos(one,nullptr,mi.rcWork.left,mi.rcWork.top,mi.rcWork.right-mi.rcWork.left+100,180,SWP_NOZORDER|SWP_NOACTIVATE);GetWindowRect(one,&beforeOne);GetWindowRect(two,&beforeTwo);
+    beginArrangement(rows,monitor);arrangementTick();GetWindowRect(one,&afterOne);GetWindowRect(two,&afterTwo);
+    check(arrangement.rows.empty()&&EqualRect(&beforeOne,&afterOne)&&EqualRect(&beforeTwo,&afterTwo),"oversized measured window cancels before moving or resizing any window");
+    beginArrangement({targetOf(two)},monitor);DestroyWindow(two);arrangementTick();check(arrangement.rows.empty(),"destroyed target cancels pending arrangement");
+    DestroyWindow(one);saved.clear();
+    using ThreadContext=HANDLE(WINAPI*)(HANDLE);auto setContext=(ThreadContext)GetProcAddress(GetModuleHandleW(L"user32.dll"),"SetThreadDpiAwarenessContext");
+    HANDLE original=setContext?setContext((HANDLE)(INT_PTR)-1):nullptr;
+    HWND unaware=CreateWindowExW(0,L"STATIC",L"Arrange DPI unaware test",WS_OVERLAPPEDWINDOW,0,0,300,180,nullptr,nullptr,instance,nullptr);
+    if(original)setContext(original);RECT beforeUnaware{},afterUnaware{};GetWindowRect(unaware,&beforeUnaware);
+    beginArrangement({targetOf(unaware)},monitor);for(int i=0;i<8&&!arrangement.rows.empty();i++)arrangementTick();GetWindowRect(unaware,&afterUnaware);
+    check(original&&arrangement.rows.empty()&&afterUnaware.right==mi.rcWork.right&&afterUnaware.top==mi.rcWork.top&&afterUnaware.right-afterUnaware.left==beforeUnaware.right-beforeUnaware.left&&afterUnaware.bottom-afterUnaware.top==beforeUnaware.bottom-beforeUnaware.top,"DPI unaware target right-aligned in physical pixels with exact size preserved");DestroyWindow(unaware);saved.clear();
+    S probe=folderOf(dir)+L"\\dpi-probe.exe";
+    if(fileExists(probe)){
+        auto runProbe=[&](bool sharp){
+            S output=dir+(sharp?L"\\probe-sharp.txt":L"\\probe-normal.txt");S command=L"\""+probe+L"\" \""+output+L"\"";std::vector<wchar_t> args(command.begin(),command.end());args.push_back(0);
+            auto environment=launchEnvironment(sharp);STARTUPINFOW startup{sizeof(startup)};startup.dwFlags=STARTF_USESHOWWINDOW;startup.wShowWindow=SW_HIDE;PROCESS_INFORMATION child{};
+            if(!CreateProcessW(probe.c_str(),args.data(),nullptr,nullptr,FALSE,CREATE_UNICODE_ENVIRONMENT,environment.data(),nullptr,&startup,&child))return false;
+            bool done=WaitForSingleObject(child.hProcess,5000)==WAIT_OBJECT_0;if(!done)TerminateProcess(child.hProcess,1);CloseHandle(child.hThread);CloseHandle(child.hProcess);
+            std::vector<unsigned char> bytes;if(!done||!readBytes(output,bytes))return false;std::string line(bytes.begin(),bytes.end());
+            return sharp?line.rfind("awareness=2 ",0)==0||line.rfind("awareness=1 ",0)==0:line.rfind("awareness=0 ",0)==0;
+        };
+        check(runProbe(false)&&runProbe(true),"real child process uses same launch environment to switch from DPI unaware to aware");
+    }
     detailsOpen=true;panelSize();check((GetWindowLongPtrW(listWindow,GWL_STYLE)&WS_VISIBLE)!=0,"optional window selection expands");detailsOpen=false;panelSize();check(!(GetWindowLongPtrW(listWindow,GWL_STYLE)&WS_VISIBLE),"window list collapses again");check(addTray(),"system tray icon registration");DestroyWindow(panel);check(!trayReady,"tray icon removed on program exit");
     printf("RESULT %d/%d passed\n",count-failed,count);return failed==0;
+}
+static S geometryReport(const Target& t){
+    RECT r{},c{},frame{};GetWindowRect(t.hwnd,&r);GetClientRect(t.hwnd,&c);
+    DwmGetWindowAttribute(t.hwnd,DWMWA_EXTENDED_FRAME_BOUNDS,&frame,sizeof(frame));
+    MONITORINFO mi{sizeof(mi)};GetMonitorInfoW(MonitorFromWindow(t.hwnd,MONITOR_DEFAULTTONEAREST),&mi);
+    auto rect=[](RECT x){return std::to_wstring(x.left)+L","+std::to_wstring(x.top)+L","+std::to_wstring(x.right)+L","+std::to_wstring(x.bottom);};
+    auto expected=outerSize(t,c.right,c.bottom);
+    using DpiFor=UINT(WINAPI*)(HWND);auto f=(DpiFor)GetProcAddress(GetModuleHandleW(L"user32.dll"),"GetDpiForWindow");
+    using WindowContext=HANDLE(WINAPI*)(HWND);using Awareness=int(WINAPI*)(HANDLE);
+    auto getContext=(WindowContext)GetProcAddress(GetModuleHandleW(L"user32.dll"),"GetWindowDpiAwarenessContext");
+    auto getAwareness=(Awareness)GetProcAddress(GetModuleHandleW(L"user32.dll"),"GetAwarenessFromDpiAwarenessContext");
+    int awareness=getContext&&getAwareness?getAwareness(getContext(t.hwnd)):-1;
+    S path;HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,t.pid);
+    if(process){wchar_t buffer[32768];DWORD n=32768;if(QueryFullProcessImageNameW(process,0,buffer,&n))path.assign(buffer,n);CloseHandle(process);}
+    return L"  路径="+path+L"\r\n  外框="+rect(r)+L" | 客户区="+rect(c)+L" | 可见边框="+rect(frame)+L"\r\n  工作区="+rect(mi.rcWork)+L" | 窗口 DPI="+std::to_wstring(f?f(t.hwnd):96)+L" | DPI 模式="+std::to_wstring(awareness)+L"（0=不感知，1=系统，2=每屏） | 系统估算外框="+std::to_wstring(expected.cx)+L"×"+std::to_wstring(expected.cy)+L"\r\n";
 }
 int WINAPI wWinMain(HINSTANCE h,HINSTANCE,LPWSTR,int show){
     instance=h;int argc=0;LPWSTR* argv=CommandLineToArgvW(GetCommandLineW(),&argc);
     bool diagnostics=false;
     for(int i=1;i<argc;i++){if(S(argv[i])==L"--self-test")testMode=true;if(S(argv[i])==L"--smoke-test")smokeMode=true;if(S(argv[i])==L"--diagnose")diagnostics=true;}
-    if(diagnostics&&argc>2){EnumWindows(enumTarget,(LPARAM)&cfg.filter);S report=L"\uFEFF鼠卫兵窗口识别诊断\r\n筛选："+cfg.filter+L"\r\n窗口数量："+std::to_wstring(targets.size())+L"\r\n";for(auto& t:targets)report+=L"PID="+std::to_wstring(t.pid)+L" | "+t.process+L" | "+t.title+L" | 身份有效="+(valid(t)?L"是":L"否")+L"\r\n";bool ok=atomicWrite(argv[argc-1],report.data(),report.size()*sizeof(wchar_t));LocalFree(argv);return ok?0:1;}
+    if(diagnostics&&argc>2){EnumWindows(enumTarget,(LPARAM)&cfg.filter);S report=L"\uFEFF鼠卫兵窗口识别诊断\r\n筛选："+cfg.filter+L"\r\n窗口数量："+std::to_wstring(targets.size())+L"\r\n";for(auto& t:targets)report+=L"PID="+std::to_wstring(t.pid)+L" | "+t.process+L" | "+t.title+L" | 身份有效="+(valid(t)?L"是":L"否")+L"\r\n"+geometryReport(t);bool ok=atomicWrite(argv[argc-1],report.data(),report.size()*sizeof(wchar_t));LocalFree(argv);return ok?0:1;}
     if(testMode){S dir=argc>2?argv[argc-1]:L".";CreateDirectoryW(dir.c_str(),nullptr);FILE* file;_wfreopen_s(&file,(dir+L"\\test-results.txt").c_str(),L"w",stdout);bool ok=selfTest(dir);fflush(stdout);LocalFree(argv);return ok?0:1;}
     LocalFree(argv);
     // A single manager avoids competing launch queues and lost hidden-window ownership.
