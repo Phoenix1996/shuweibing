@@ -68,7 +68,7 @@ static int launchRemaining=0, launchTotal=0;
 static LaunchSpec launchSpec;
 struct StartupWindow {DWORD pid;uint64_t born;HWND hwnd=nullptr;int width=0,height=0;ULONGLONG stableSince=0,lastSeen=0;};
 static std::vector<StartupWindow> startupWindows;
-static ULONGLONG startupDeadline=0,lastLaunchAt=0;
+static ULONGLONG startupDeadline=0;
 static bool updateBusy=false;
 static updates::Result* pendingUpdate=nullptr;
 static std::map<int,HWND> controls;
@@ -489,13 +489,13 @@ static void launchOne(){
         DWORD e=GetLastError();stopStartup();status(L"启动失败。"+winError(e)+(e==ERROR_ELEVATION_REQUIRED?L"该启动器要求管理员权限，可手动打开后再管理窗口。":L""));return;
     }
     FILETIME born{},exit{},kernel{},user{};uint64_t birth=0;if(GetProcessTimes(pi.hProcess,&born,&exit,&kernel,&user))memcpy(&birth,&born,8);
-    startupWindows.push_back({pi.dwProcessId,birth});lastLaunchAt=GetTickCount64();CloseHandle(pi.hThread);CloseHandle(pi.hProcess);launchRemaining--;status(L"已启动 "+std::to_wstring(launchTotal-launchRemaining)+L" / "+std::to_wstring(launchTotal)+L" 个进程，等待游戏窗口就绪…");
+    startupWindows.push_back({pi.dwProcessId,birth});CloseHandle(pi.hThread);CloseHandle(pi.hProcess);launchRemaining--;status(L"已启动 "+std::to_wstring(launchTotal-launchRemaining)+L" / "+std::to_wstring(launchTotal)+L" 个进程，等待游戏窗口就绪…");
     if(launchRemaining==0){KillTimer(mainWindow,1);SetTimer(mainWindow,3,1500,nullptr);}
 }
 static bool observeStartup(StartupWindow& row,const Target& t,ULONGLONG now){
     RECT c{};if(!valid(t)||t.pid!=row.pid||t.born!=row.born||!IsWindowVisible(t.hwnd)||(GetWindowLongPtrW(t.hwnd,GWL_EXSTYLE)&WS_EX_TOOLWINDOW)||GetWindow(t.hwnd,GW_OWNER)||!GetClientRect(t.hwnd,&c)||c.right<320||c.bottom<180||abs(c.right*9-c.bottom*16)>32)return false;
     if(row.hwnd!=t.hwnd||row.width!=c.right||row.height!=c.bottom||now-row.lastSeen>750){row.hwnd=t.hwnd;row.width=c.right;row.height=c.bottom;row.stableSince=now;}row.lastSeen=now;
-    return now-row.stableSince>=2000;
+    return now-row.stableSince>=1000;
 }
 struct StartupScan {ULONGLONG now;std::set<DWORD> ready;};
 static BOOL CALLBACK scanStartup(HWND w,LPARAM context){auto scan=(StartupScan*)context;DWORD pid=0;GetWindowThreadProcessId(w,&pid);for(auto& row:startupWindows)if(row.pid==pid&&observeStartup(row,targetOf(w),scan->now))scan->ready.insert(pid);return TRUE;}
@@ -503,14 +503,14 @@ static void startupTick(){
     if(startupWindows.empty()){KillTimer(mainWindow,6);return;}ULONGLONG now=GetTickCount64();
     if(now>startupDeadline){stopStartup();refresh();status(L"等待游戏窗口超时；已启动游戏继续运行，可刷新后手动排列。");return;}
     StartupScan scan{now,{}};EnumWindows(scanStartup,(LPARAM)&scan);
-    if(launchRemaining||now-lastLaunchAt<6000||scan.ready.size()!=startupWindows.size())return;
+    if(launchRemaining||scan.ready.size()!=startupWindows.size())return;
     for(auto& row:startupWindows){auto t=targetOf(row.hwnd);if(valid(t)&&t.pid==row.pid&&t.born==row.born)manualTargets.push_back(t);}
     stopStartup();refresh();status(L"游戏窗口已就绪，正在应用尺寸并排列…");operate(Arrange);
 }
 static void beginLaunch(){
     if(launchRemaining>0||!startupWindows.empty())return;Settings c;if(!collect(c))return;LaunchSpec next;S error;
     if(!resolveLaunch(c.path,c.args,next,error)){status(error);return;}
-    stopArrangement();cfg=c;persist();launchSpec=next;startupWindows.clear();startupDeadline=GetTickCount64()+120000;launchRemaining=launchTotal=c.count;EnableWindow(controls[Launch],FALSE);EnableWindow(controls[Cancel],TRUE);SetTimer(mainWindow,1,c.delay,nullptr);SetTimer(mainWindow,6,500,nullptr);launchOne();
+    stopArrangement();cfg=c;persist();launchSpec=next;startupWindows.clear();startupDeadline=GetTickCount64()+120000;launchRemaining=launchTotal=c.count;EnableWindow(controls[Launch],FALSE);EnableWindow(controls[Cancel],TRUE);SetTimer(mainWindow,1,c.delay,nullptr);SetTimer(mainWindow,6,250,nullptr);launchOne();
 }
 static void browse(){wchar_t path[32768]{};OPENFILENAMEW o{};o.lStructSize=sizeof(o);o.hwndOwner=mainWindow;o.lpstrFilter=L"游戏或启动器 (*.exe)\0*.exe\0\0";o.lpstrFile=path;o.nMaxFile=32768;o.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;if(GetOpenFileNameW(&o)){set(Path,path);persist();}}
 static const wchar_t* OfficialDownload=L"https://yys.163.com/zmb/";
@@ -894,8 +894,8 @@ static bool selfTest(const S& dir,bool ciMode=false){
     check(panelBounds.top>=work.rcWork.top&&panelBounds.bottom<=work.rcWork.bottom,"expanded panel is repositioned and kept inside work area at 150 percent scale");dpi=originalDpi;fonts();panelSize();
     detailsOpen=false;panelSize();check(!(GetWindowLongPtrW(listWindow,GWL_STYLE)&WS_VISIBLE)&&!(GetWindowLongPtrW(controls[BossKey],GWL_STYLE)&WS_VISIBLE),"window list and boss settings collapse again");
     HWND readyWindow=CreateWindowExW(0,L"STATIC",L"Startup Test",WS_OVERLAPPEDWINDOW|WS_VISIBLE,0,0,640,360,nullptr,nullptr,instance,nullptr);Target readyTarget=targetOf(readyWindow);clientResize(readyTarget,640,360);StartupWindow startup{readyTarget.pid,readyTarget.born};
-    bool initially=!observeStartup(startup,readyTarget,1000);for(ULONGLONG now=1500;now<3000;now+=500)observeStartup(startup,readyTarget,now);
-    check(initially&&observeStartup(startup,readyTarget,3000),"one-click startup waits for a valid visible game-sized window to remain stable");
+    bool initially=!observeStartup(startup,readyTarget,1000);for(ULONGLONG now=1250;now<2000;now+=250)initially=initially&&!observeStartup(startup,readyTarget,now);
+    check(initially&&observeStartup(startup,readyTarget,2000),"one-click startup waits one second of stable main-window dimensions");
     clientResize(readyTarget,320,180);check(!observeStartup(startup,readyTarget,3500),"startup stability restarts after window size changes");
     startupWindows.push_back(startup);launchRemaining=1;stopStartup();check(startupWindows.empty()&&launchRemaining==0&&valid(readyTarget),"stop startup cancels readiness tracking and leaves launched window alive");
     check(sendCloseRequests({readyTarget},false)==0&&valid(readyTarget),"cancelled batch close leaves game window untouched");
@@ -906,12 +906,13 @@ static bool selfTest(const S& dir,bool ciMode=false){
     check(repeats,"ten size-and-arrange operations apply the configured size without progressive drift");DestroyWindow(sized);saved.clear();
     updates::selfTest(dir,check);
     // Filter out every real game. Only explicitly tracked synthetic children can be arranged.
-    set(Filter,L"__SHUWEIBING_TEST_ONLY__");set(Path,dir+L"\\多开测试 带空格\\Launch.exe");set(Args,L"--startup-fixture \""+dir+L"\\one-click.txt\"");set(Count,L"2");set(Delay,L"500");set(Width,L"640");manualTargets.clear();targets.clear();beginLaunch();
+    set(Filter,L"__SHUWEIBING_TEST_ONLY__");set(Path,dir+L"\\多开测试 带空格\\Launch.exe");set(Args,L"--startup-fixture \""+dir+L"\\one-click.txt\"");set(Count,L"2");set(Delay,L"500");set(Width,L"640");manualTargets.clear();targets.clear();ULONGLONG started=GetTickCount64();beginLaunch();
     ULONGLONG until=GetTickCount64()+11000;bool finished=false;
     while(GetTickCount64()<until){while(PeekMessageW(&pending,nullptr,0,0,PM_REMOVE)){TranslateMessage(&pending);DispatchMessageW(&pending);}if(launchRemaining==0&&startupWindows.empty()&&arrangement.rows.empty()){finished=true;break;}Sleep(20);}
     refresh();auto launched=targets;bool exact=finished&&launched.size()==2;
     for(auto& child:launched){RECT c{},r{};GetClientRect(child.hwnd,&c);GetWindowRect(child.hwnd,&r);exact=exact&&valid(child)&&c.right==640&&c.bottom==360&&r.right<=mi.rcWork.right&&r.left>=mi.rcWork.left&&r.top>=mi.rcWork.top&&r.bottom<=mi.rcWork.bottom;}
     check(exact,"one click launches two synthetic logo windows, waits for readiness, then sizes and arranges them");
+    check(finished&&GetTickCount64()-started<5500,"ready synthetic windows arrange before the former six-second minimum wait");
     stopStartup();stopArrangement();sendCloseRequests(launched,true);for(auto& child:launched){HANDLE p=OpenProcess(SYNCHRONIZE|PROCESS_TERMINATE,FALSE,child.pid);if(p){if(WaitForSingleObject(p,2000)!=WAIT_OBJECT_0)TerminateProcess(p,1);CloseHandle(p);}}manualTargets.clear();
     check(FindResourceW(instance,MAKEINTRESOURCEW(102),RT_RCDATA)&&FindResourceW(instance,MAKEINTRESOURCEW(103),RT_RCDATA),"standalone executable embeds project and bundled library licenses");
     // Hosted runners may lack Explorer; keep the full tray check on desktops.
