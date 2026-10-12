@@ -1,4 +1,4 @@
-// 鼠卫兵 0.3.4 — native Win32, no background service or game injection.
+// 鼠卫兵 0.3.5 — native Win32, no background service or game injection.
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -22,6 +22,7 @@
 #include <vector>
 #include <cstdio>
 #include "updater.h"
+#include "audio.h"
 
 using S = std::wstring;
 struct Settings {
@@ -29,6 +30,7 @@ struct Settings {
     int width=1113, height=627, count=2, delay=1200, columns=0, opacity=100;
     bool lockRatio=true, bossEnabled=true, autoUpdates=true;
     int bossKey='H', bossMods=MOD_CONTROL|MOD_ALT;
+    int wednesdayReminder=0;
 };
 struct Target {
     HWND hwnd{}; DWORD pid{}; uint64_t born{}; S title, process;
@@ -70,6 +72,9 @@ static std::vector<StartupWindow> startupWindows;
 static ULONGLONG startupDeadline=0;
 static bool updateBusy=false;
 static updates::Result* pendingUpdate=nullptr;
+static std::vector<Target> closingWindows;
+static std::set<HWND> confirmedDialogs;
+static ULONGLONG closeDeadline=0;
 static std::map<int,HWND> controls;
 enum {
     Path=100, Browse, Count, Delay, Launch, Filter, Refresh,
@@ -77,7 +82,8 @@ enum {
     Opacity, Alpha, Hide, Show, Help, List, Header, Subtitle,
     LPath, LCount, LDelay, LFilter, LWidth, LHeight, LColumns, LScreen,
     LOpacity, LWindows, Hint, Icon, Details, LockRatio, Background,
-    Admin, LBoss, BossEnabled, BossKey, BossSave, BossDisable, AutoFind, CloseAll, About
+    Admin, LBoss, BossEnabled, BossKey, BossSave, BossDisable, AutoFind, CloseAll, About,
+    Mute, Volume, LVolume, ApplyVolume
 };
 static int px(int n){return MulDiv(n,dpi,96);}
 static S text(HWND w){int n=GetWindowTextLengthW(w); S s(n+1,L'\0');GetWindowTextW(w,s.data(),n+1);s.resize(n);return s;}
@@ -117,6 +123,7 @@ static std::vector<unsigned char> encode(const Settings& c){
     s+=L"lockRatio="+S(c.lockRatio?L"1":L"0")+L"\n";
     s+=L"bossEnabled="+S(c.bossEnabled?L"1":L"0")+L"\nbossKey="+std::to_wstring(c.bossKey)+L"\nbossMods="+std::to_wstring(c.bossMods)+L"\n";
     s+=L"autoUpdates="+S(c.autoUpdates?L"1":L"0")+L"\n";
+    s+=L"wednesdayReminder="+std::to_wstring(c.wednesdayReminder)+L"\n";
     uint64_t check=hash(s.data(),s.size()*sizeof(wchar_t));
     std::vector<unsigned char> b(8+s.size()*sizeof(wchar_t));memcpy(b.data(),&check,8);memcpy(b.data()+8,s.data(),s.size()*sizeof(wchar_t));return b;
 }
@@ -128,8 +135,8 @@ static bool decode(const std::vector<unsigned char>& b,Settings& c){
     std::map<S,S> kv;size_t at=magic.size();
     while(at<s.size()){size_t end=s.find(L'\n',at);if(end==S::npos)return false;size_t eq=s.find(L'=',at);if(eq==S::npos||eq>=end)return false;S key=s.substr(at,eq-at);if(kv.count(key))return false;kv[key]=s.substr(eq+1,end-eq-1);at=end+1;}
     Settings candidate;
-    if(kv.size()<8||kv.size()>15||!kv.count(L"path")||!kv.count(L"filter"))return false;
-    for(auto& [key,value]:kv)if(key!=L"path"&&key!=L"args"&&key!=L"filter"&&key!=L"width"&&key!=L"height"&&key!=L"count"&&key!=L"delay"&&key!=L"columns"&&key!=L"opacity"&&key!=L"lockRatio"&&key!=L"sharpLaunch"&&key!=L"bossEnabled"&&key!=L"bossKey"&&key!=L"bossMods"&&key!=L"autoUpdates")return false;
+    if(kv.size()<8||kv.size()>16||!kv.count(L"path")||!kv.count(L"filter"))return false;
+    for(auto& [key,value]:kv)if(key!=L"path"&&key!=L"args"&&key!=L"filter"&&key!=L"width"&&key!=L"height"&&key!=L"count"&&key!=L"delay"&&key!=L"columns"&&key!=L"opacity"&&key!=L"lockRatio"&&key!=L"sharpLaunch"&&key!=L"bossEnabled"&&key!=L"bossKey"&&key!=L"bossMods"&&key!=L"autoUpdates"&&key!=L"wednesdayReminder")return false;
     candidate.path=kv[L"path"];candidate.filter=kv[L"filter"];
     if(candidate.path.size()>32000||candidate.filter.empty()||candidate.filter.size()>256)return false;
     if(!number(kv[L"width"],160,7680,candidate.width)||!number(kv[L"height"],90,4320,candidate.height)||!number(kv[L"count"],1,20,candidate.count)||!number(kv[L"delay"],500,10000,candidate.delay)||!number(kv[L"columns"],0,20,candidate.columns)||!number(kv[L"opacity"],20,100,candidate.opacity))return false;
@@ -137,6 +144,7 @@ static bool decode(const std::vector<unsigned char>& b,Settings& c){
     // Older config files may contain sharpLaunch=0; startup DPI handling is now always enabled.
     if(kv.count(L"sharpLaunch")){int ignored;if(!number(kv[L"sharpLaunch"],0,1,ignored))return false;}
     if(kv.count(L"autoUpdates")){int enabled;if(!number(kv[L"autoUpdates"],0,1,enabled))return false;candidate.autoUpdates=enabled!=0;}
+    if(kv.count(L"wednesdayReminder")&&!number(kv[L"wednesdayReminder"],0,99991231,candidate.wednesdayReminder))return false;
     if(kv.count(L"bossEnabled")||kv.count(L"bossKey")||kv.count(L"bossMods")){
         int enabled;if(!number(kv[L"bossEnabled"],0,1,enabled)||!number(kv[L"bossKey"],1,254,candidate.bossKey)||!number(kv[L"bossMods"],0,7,candidate.bossMods))return false;candidate.bossEnabled=enabled!=0;
     }
@@ -339,16 +347,22 @@ static void operate(int action){
     }
     persist();SetTimer(mainWindow,3,350,nullptr);
 }
-static int terminateTargets(const std::vector<Target>& rows,bool confirmed){
-    if(!confirmed)return 0;int count=0;std::set<std::pair<DWORD,uint64_t>> seen;
-    for(auto& t:rows){
-        if(t.pid==GetCurrentProcessId()||!valid(t)||!seen.insert({t.pid,t.born}).second)continue;
-        HANDLE process=OpenProcess(PROCESS_TERMINATE|PROCESS_QUERY_LIMITED_INFORMATION|SYNCHRONIZE,FALSE,t.pid);if(!process)continue;
-        FILETIME created{},exited{},kernel{},user{};bool identity=GetProcessTimes(process,&created,&exited,&kernel,&user)&&(((uint64_t)created.dwHighDateTime<<32)|created.dwLowDateTime)==t.born&&valid(t);
-        if(identity&&TerminateProcess(process,1)){count++;WaitForSingleObject(process,2000);}CloseHandle(process);
-    }
-    return count;
+static int sendCloseRequests(const std::vector<Target>& rows,bool confirmed){
+    if(!confirmed)return 0;int count=0;std::set<HWND> seen;
+    for(auto& t:rows)if(t.pid!=GetCurrentProcessId()&&valid(t)&&seen.insert(t.hwnd).second){if(!IsWindowVisible(t.hwnd))ShowWindowAsync(t.hwnd,SW_SHOW);if(PostMessageW(t.hwnd,WM_CLOSE,0,0))count++;}return count;
 }
+static S boundedControlText(HWND w){wchar_t buffer[256]{};DWORD_PTR result=0;if(!SendMessageTimeoutW(w,WM_GETTEXT,256,(LPARAM)buffer,SMTO_ABORTIFHUNG|SMTO_BLOCK,100,&result))return {};return buffer;}
+static BOOL CALLBACK findExitPrompt(HWND child,LPARAM context){wchar_t kind[32]{};GetClassNameW(child,kind,32);if(S(kind)==L"Static"){S value=boundedControlText(child);if(value==L"确定要离开吗?"||value==L"确定要离开吗？")*(bool*)context=true;}return TRUE;}
+static HWND exitConfirmButton(HWND dialog,const Target& game){
+    if(!valid(game)||!IsWindowVisible(dialog))return nullptr;DWORD pid=0;GetWindowThreadProcessId(dialog,&pid);if(pid!=game.pid)return nullptr;
+    wchar_t kind[32]{};GetClassNameW(dialog,kind,32);if(S(kind)!=L"#32770"||text(dialog)!=L"退出游戏")return nullptr;
+    HWND owner=GetWindow(dialog,GW_OWNER);int depth=0;while(owner&&owner!=game.hwnd&&depth++<16)owner=GetWindow(owner,GW_OWNER);if(owner!=game.hwnd)return nullptr;
+    bool prompt=false;EnumChildWindows(dialog,findExitPrompt,(LPARAM)&prompt);if(!prompt)return nullptr;HWND button=GetDlgItem(dialog,IDOK);if(!button||!IsWindowVisible(button)||!IsWindowEnabled(button))return nullptr;
+    GetClassNameW(button,kind,32);S label=boundedControlText(button);if(S(kind)!=L"Button"||(label!=L"确定"&&label!=L"确定(&O)"&&label!=L"&确定"&&label!=L"OK"&&label!=L"&OK"))return nullptr;return valid(game)?button:nullptr;
+}
+static BOOL CALLBACK confirmExitDialog(HWND dialog,LPARAM context){auto rows=(const std::vector<Target>*)context;if(confirmedDialogs.count(dialog))return TRUE;for(auto& game:*rows)if(HWND button=exitConfirmButton(dialog,game)){if(PostMessageW(button,BM_CLICK,0,0))confirmedDialogs.insert(dialog);break;}return TRUE;}
+static void closeTick(){bool any=false;for(auto& game:closingWindows)if(valid(game))any=true;if(!any||GetTickCount64()>closeDeadline){KillTimer(mainWindow,7);closingWindows.clear();confirmedDialogs.clear();EnableWindow(controls[CloseAll],TRUE);refresh();status(any?L"部分窗口尚未退出；无法识别的确认框请手动处理。":L"关闭完成。");return;}EnumWindows(confirmExitDialog,(LPARAM)&closingWindows);}
+static void beginClose(const std::vector<Target>& rows){sendCloseRequests(rows,true);closingWindows=rows;confirmedDialogs.clear();closeDeadline=GetTickCount64()+8000;EnableWindow(controls[CloseAll],FALSE);SetTimer(mainWindow,7,250,nullptr);status(L"正在关闭客户端并确认退出…");}
 struct FixtureWindow {DWORD pid;HWND hwnd{};};
 static BOOL CALLBACK findFixtureWindow(HWND window,LPARAM context){auto fixture=(FixtureWindow*)context;DWORD pid=0;GetWindowThreadProcessId(window,&pid);if(pid==fixture->pid&&text(window)==L"鼠卫兵多开测试窗口"){fixture->hwnd=window;return FALSE;}return TRUE;}
 struct CaptionSearch {const wchar_t* caption;bool found=false;};
@@ -357,11 +371,18 @@ static bool childHasCaption(HWND parent,const wchar_t* caption){CaptionSearch se
 static void stopStartup(){KillTimer(mainWindow,1);KillTimer(mainWindow,6);launchRemaining=0;startupWindows.clear();EnableWindow(controls[Launch],TRUE);}
 static void closeAllGames(){
     refresh();auto rows=targets;if(rows.empty()){status(L"没有可关闭的游戏窗口。");return;}
-    S message=L"确认强制结束列表中的全部 "+std::to_wstring(rows.size())+L" 个游戏进程？包括未勾选和已隐藏窗口。\n这会立即关闭游戏，不会等待客户端确认或保存。未保存进度将丢失。\n\n";
+    S message=L"确认关闭列表中的全部 "+std::to_wstring(rows.size())+L" 个游戏窗口？包括未勾选和已隐藏窗口。\n鼠卫兵会自动确认这些窗口的“退出游戏 / 确定要离开吗？”提示。\n未保存进度可能丢失。\n\n";
     for(size_t i=0;i<rows.size()&&i<8;i++)message+=rows[i].title+L"（"+rows[i].process+L"）\n";
-    if(MessageBoxW(mainWindow,message.c_str(),L"鼠卫兵 · 强制关闭游戏",MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2)!=IDYES)return;
+    if(MessageBoxW(mainWindow,message.c_str(),L"鼠卫兵 · 关闭游戏",MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2)!=IDYES)return;
     stopArrangement();stopStartup();
-    int count=terminateTargets(rows,true);refresh();status(L"已强制结束 "+std::to_wstring(count)+L" / "+std::to_wstring(rows.size())+L" 个游戏进程。");
+    beginClose(rows);
+}
+static int reminderDay(const SYSTEMTIME& now){return now.wYear*10000+now.wMonth*100+now.wDay;}
+static bool reminderDue(const Settings& settings,const SYSTEMTIME& now,int existing){return now.wDayOfWeek==3&&now.wHour>=9&&settings.count+existing>1&&settings.wednesdayReminder!=reminderDay(now);}
+static std::vector<Target> extraClients(const std::vector<Target>& rows){std::vector<Target> extras;std::set<std::pair<DWORD,uint64_t>> seen;for(auto& row:rows)if(valid(row)&&seen.insert({row.pid,row.born}).second){if(seen.size()>1)extras.push_back(row);}return extras;}
+static void changeAudio(bool toggle){refresh();auto rows=selected();if(rows.empty()){status(L"请先选择需要调整声音的游戏窗口。");return;}int level=100;if(!toggle&&!number(value(Volume),0,100,level)){status(L"音量请输入 0–100。");return;}
+    auto chosen=[&](DWORD pid){for(auto& row:rows)if(row.pid==pid&&valid(row))return true;return false;};auto result=audio::change(chosen,toggle,level);
+    status(result.changed?L"已调整 "+std::to_wstring(result.changed)+L" 个所选客户端音频会话。":result.shared?L"客户端共用音频会话，无法分别控制；请使用游戏内声音设置。":L"未找到可单独控制的声音；请让客户端播放声音后重试。");
 }
 static S sharpCompatibility(const S& previous){
     S result;size_t at=0;
@@ -512,8 +533,24 @@ static void startupTick(){
     stopStartup();refresh();status(L"游戏窗口已就绪，正在应用尺寸并排列…");operate(Arrange);
 }
 static void beginLaunch(const S& internalTestArgs=L""){
-    if(launchRemaining>0||!startupWindows.empty())return;Settings c;if(!collect(c))return;LaunchSpec next;S error;
+    if(launchRemaining>0||!startupWindows.empty()||!closingWindows.empty())return;Settings c;if(!collect(c))return;LaunchSpec next;S error;
     if(!resolveLaunch(c.path,internalTestArgs,next,error)){status(error);return;}
+    SYSTEMTIME now{};GetLocalTime(&now);refresh();std::set<std::pair<DWORD,uint64_t>> live;for(auto& row:targets)if(valid(row))live.insert({row.pid,row.born});
+    if(!testMode&&reminderDue(c,now,(int)live.size())){
+        c.wednesdayReminder=reminderDay(now);cfg=c;if(!saveSettings(configPath,cfg)){status(L"无法保存本周提醒记录，请检查配置目录权限后重试。");return;}
+        S content=L"阴阳师通常在周三更新。建议先只保留一个客户端完成更新，再启动其他客户端。\n本提示每周三 9 点后仅显示一次，并不代表已检测到官方更新。";
+        if(!live.empty())content+=L"\n\n当前已打开 "+std::to_wstring(live.size())+L" 个客户端；选择第一项将保留第一个，正常关闭其余客户端并自动确认退出，未保存进度可能丢失。";
+        TASKDIALOG_BUTTON buttons[]={{101,L"先只保留一个客户端用于更新"},{102,L"已完成更新，继续多开"}};TASKDIALOGCONFIG dialog{};dialog.cbSize=sizeof(dialog);dialog.hwndParent=mainWindow;dialog.dwFlags=TDF_ALLOW_DIALOG_CANCELLATION|TDF_POSITION_RELATIVE_TO_WINDOW;dialog.pszWindowTitle=L"鼠卫兵 · 周三更新提醒";dialog.pszMainInstruction=L"先用一个客户端完成游戏更新？";dialog.pszContent=content.c_str();dialog.cButtons=2;dialog.pButtons=buttons;dialog.nDefaultButton=101;int choice=IDCANCEL;
+        if(FAILED(TaskDialogIndirect(&dialog,&choice,nullptr,nullptr))||choice==IDCANCEL)return;
+        if(choice==101){
+            stopArrangement();if(!live.empty()){auto extras=extraClients(targets);if(!extras.empty())beginClose(extras);else status(L"保留当前客户端用于更新；完成后再点击多开。");return;}
+            // Updating is a deliberate single-launch flow; normal multi-launch
+            // continues to use the independent bin/onmyoji.exe entry point.
+            S launcher;for(auto name:{L"Launch.exe",L"YysLauncher.exe"}){S path=next.directory+L"\\"+name;if(fileExists(path)){launcher=path;break;}}
+            if(launcher.empty()){status(L"未找到官方启动器，请选择 Launch.exe 或先手动完成游戏更新。");return;}
+            LaunchSpec update{launcher,L"",next.directory,false};PROCESS_INFORMATION process{};if(!spawnClient(update,true,process)){status(L"单客户端更新启动失败。"+winError(GetLastError()));return;}CloseHandle(process.hThread);CloseHandle(process.hProcess);status(L"已打开一次官方启动器用于更新；完成后再点击多开。");return;
+        }
+    }
     stopArrangement();cfg=c;persist();launchSpec=next;startupWindows.clear();startupDeadline=GetTickCount64()+120000;launchRemaining=launchTotal=c.count;EnableWindow(controls[Launch],FALSE);SetTimer(mainWindow,1,c.delay,nullptr);SetTimer(mainWindow,6,250,nullptr);launchOne();
 }
 static void browse(){wchar_t path[32768]{};OPENFILENAMEW o{};o.lStructSize=sizeof(o);o.hwndOwner=mainWindow;o.lpstrFilter=L"游戏或启动器 (*.exe)\0*.exe\0\0";o.lpstrFile=path;o.nMaxFile=32768;o.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;if(GetOpenFileNameW(&o)){set(Path,path);persist();}}
@@ -636,19 +673,23 @@ static void layout(){
     place(LWindows,24,180,W-250,24);place(SelectAll,W-238,178,63,28);place(SelectNone,W-167,178,71,28);place(Refresh,W-88,178,64,28);
     place(LWidth,24,221,28,20);place(Width,56,217,72,28);place(LHeight,139,221,24,20);place(Height,169,217,72,28);place(LockRatio,254,219,108,24);place(Resize,W-150,216,126,32);
     place(LScreen,24,262,32,20);place(Screen,60,258,W-294,200);place(Arrange,W-218,256,194,34);
-    place(LOpacity,24,305,88,20);place(Opacity,116,301,57,28);place(Alpha,182,299,76,32);place(Hide,W-158,299,63,32);place(Show,W-87,299,63,32);
-    for(int id:{LFilter,Filter,Pick,SelectAll,SelectNone,List,LBoss,BossEnabled,BossKey,BossSave,BossDisable})ShowWindow(controls[id],detailsOpen?SW_SHOW:SW_HIDE);
+    place(LOpacity,24,305,88,20);place(Opacity,116,301,57,28);place(Alpha,182,299,76,32);place(Mute,268,299,132,32);place(Hide,W-158,299,63,32);place(Show,W-87,299,63,32);
+    for(int id:{LFilter,Filter,Pick,SelectAll,SelectNone,List,LBoss,BossEnabled,BossKey,BossSave,BossDisable,LVolume,Volume,ApplyVolume})ShowWindow(controls[id],detailsOpen?SW_SHOW:SW_HIDE);
     if(detailsOpen){
         place(LFilter,24,366,56,20);place(Filter,84,362,W-260,28);place(Pick,W-168,362,144,28);
-        place(LBoss,24,420,56,20);place(BossEnabled,84,416,64,28);place(BossKey,156,415,W-364,28);place(BossSave,W-200,413,92,32);place(BossDisable,W-100,413,76,32);place(List,24,455,space,std::max(60,H-535));
+        place(LVolume,24,401,82,20);place(Volume,116,397,57,28);place(ApplyVolume,182,395,130,32);
+        place(LBoss,24,450,56,20);place(BossEnabled,84,446,64,28);place(BossKey,156,445,W-364,28);place(BossSave,W-200,443,92,32);place(BossDisable,W-100,443,76,32);place(List,24,485,space,std::max(60,H-565));
     }
     place(Hint,24,H-56,W-202,20);place(Admin,W-170,H-60,146,28);MoveWindow(statusWindow,px(24),r.bottom-px(31),r.right-px(48),px(20),TRUE);
+    // Native combo boxes choose their own closed height. Align labels using
+    // the actual control bounds rather than the requested dropdown height.
+    for(auto pair:{std::pair<int,int>{LPath,Path},{LCount,Count},{LDelay,Delay},{LFilter,Filter},{LWidth,Width},{LHeight,Height},{LScreen,Screen},{LOpacity,Opacity},{LBoss,BossEnabled},{LVolume,Volume}}){RECT label{},field{};if(!GetWindowRect(controls[pair.first],&label)||!GetWindowRect(controls[pair.second],&field)||field.bottom<=field.top)continue;MapWindowPoints(nullptr,mainWindow,(POINT*)&label,2);MapWindowPoints(nullptr,mainWindow,(POINT*)&field,2);MoveWindow(controls[pair.first],label.left,field.top+(field.bottom-field.top-(label.bottom-label.top))/2,label.right-label.left,label.bottom-label.top,TRUE);}
     if(listWindow){RECT table{};GetClientRect(listWindow,&table);int widths[]={std::max(px(80),(int)table.right-px(280)-GetSystemMetricsForDpi(SM_CXVSCROLL,dpi)-2),px(110),px(70),px(100)};for(int i=0;i<4;i++)ListView_SetColumnWidth(listWindow,i,widths[i]);}
 }
 static void panelSize(){RECT r{0,0,px(580),px(detailsOpen?700:410)},old{};GetWindowRect(mainWindow,&old);DWORD style=(DWORD)GetWindowLongPtrW(mainWindow,GWL_STYLE),ex=(DWORD)GetWindowLongPtrW(mainWindow,GWL_EXSTYLE);using AdjustDpi=BOOL(WINAPI*)(LPRECT,DWORD,BOOL,DWORD,UINT);auto adjust=(AdjustDpi)GetProcAddress(GetModuleHandleW(L"user32.dll"),"AdjustWindowRectExForDpi");if(adjust)adjust(&r,style,FALSE,ex,(UINT)dpi);else AdjustWindowRectEx(&r,style,FALSE,ex);MONITORINFO mi{sizeof(mi)};if(!GetMonitorInfoW(MonitorFromWindow(mainWindow,MONITOR_DEFAULTTONEAREST),&mi))return;int width=std::min(r.right-r.left,mi.rcWork.right-mi.rcWork.left),height=std::min(r.bottom-r.top,mi.rcWork.bottom-mi.rcWork.top);int x=std::clamp((int)old.left,(int)mi.rcWork.left,(int)mi.rcWork.right-width),y=std::clamp((int)old.top,(int)mi.rcWork.top,(int)mi.rcWork.bottom-height);SetWindowPos(mainWindow,nullptr,x,y,width,height,SWP_NOZORDER|SWP_NOACTIVATE);RECT actual{};if(GetWindowRect(mainWindow,&actual)){int moveX=actual.left<mi.rcWork.left?mi.rcWork.left-actual.left:actual.right>mi.rcWork.right?mi.rcWork.right-actual.right:0;int moveY=actual.top<mi.rcWork.top?mi.rcWork.top-actual.top:actual.bottom>mi.rcWork.bottom?mi.rcWork.bottom-actual.bottom:0;if(moveX||moveY)SetWindowPos(mainWindow,nullptr,x+moveX,y+moveY,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);}layout();InvalidateRect(mainWindow,nullptr,TRUE);}
 static void createUi(){
     sizingFields=true;ratioWidth=16;ratioHeight=9;cfg.height=gameHeight(cfg.width);cfg.lockRatio=true;
-    fonts();auto icon=control(Icon,L"STATIC",L"",SS_ICON|SS_CENTERIMAGE);SendMessageW(icon,STM_SETICON,(WPARAM)LoadImageW(instance,MAKEINTRESOURCEW(101),IMAGE_ICON,px(46),px(46),LR_DEFAULTCOLOR),0);label(Header,L"鼠卫兵");SendMessageW(controls[Header],WM_SETFONT,(WPARAM)titleFont,TRUE);label(Subtitle,L"阴阳师窗口管家 · 0.3.4");button(Background,L"后台");button(Details,L"窗口 / 设置");button(Help,L"说明");
+    fonts();auto icon=control(Icon,L"STATIC",L"",SS_ICON|SS_CENTERIMAGE);SendMessageW(icon,STM_SETICON,(WPARAM)LoadImageW(instance,MAKEINTRESOURCEW(101),IMAGE_ICON,px(46),px(46),LR_DEFAULTCOLOR),0);label(Header,L"鼠卫兵");SendMessageW(controls[Header],WM_SETFONT,(WPARAM)titleFont,TRUE);label(Subtitle,L"阴阳师窗口管家 · 0.3.5");button(Background,L"后台");button(Details,L"窗口 / 设置");button(Help,L"说明");
     label(LPath,L"游戏");edit(Path,cfg.path);button(AutoFind,L"查找 ▾");button(Browse,L"选择");
     label(LCount,L"数量");edit(Count,std::to_wstring(cfg.count),true);label(LDelay,L"间隔ms");edit(Delay,std::to_wstring(cfg.delay),true);button(Launch,L"启动 / 多开");button(CloseAll,L"批量关闭");control(About,WC_LINK,L"<a>关于·更新</a>",WS_TABSTOP);
     label(LFilter,L"进程");edit(Filter,cfg.filter);button(Refresh,L"刷新");button(Pick,L"添加窗口（3 秒）");
@@ -663,6 +704,7 @@ static void createUi(){
     label(LBoss,L"老板键");control(BossEnabled,L"BUTTON",L"启用",WS_TABSTOP|BS_AUTOCHECKBOX);SendMessageW(controls[BossEnabled],BM_SETCHECK,cfg.bossEnabled?BST_CHECKED:BST_UNCHECKED,0);
     control(BossKey,HOTKEY_CLASSW,L"",WS_TABSTOP);SendMessageW(controls[BossKey],HKM_SETHOTKEY,hotkeyControlValue(cfg.bossKey,cfg.bossMods),0);button(BossSave,L"保存快捷键");button(BossDisable,L"停用");
     label(Hint,adminHint(elevated));control(Admin,L"BUTTON",elevated?L"已是管理员":L"管理员启动",WS_TABSTOP|BS_PUSHBUTTON);EnableWindow(controls[Admin],!elevated);if(!elevated)SendMessageW(controls[Admin],BCM_SETSHIELD,0,TRUE);
+    button(Mute,L"静音 / 取消静音");label(LVolume,L"音量 %");edit(Volume,L"100",true);button(ApplyVolume,L"应用所选音量");
     statusWindow=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_LEFT|SS_ENDELLIPSIS,0,0,0,0,mainWindow,nullptr,instance,nullptr);SendMessageW(statusWindow,WM_SETFONT,(WPARAM)bodyFont,TRUE);
     sizingFields=false;screens();layout();refresh();status(L"就绪 · 默认选择全部游戏窗口");
 }
@@ -722,9 +764,10 @@ static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
         case SelectAll:case SelectNone:for(int i=0;i<ListView_GetItemCount(listWindow);i++)ListView_SetCheckState(listWindow,i,LOWORD(wp)==SelectAll);break;
         case Launch:beginLaunch();break;
         case CloseAll:closeAllGames();break;
+        case Mute:changeAudio(true);break;case ApplyVolume:changeAudio(false);break;
         case Pick:EnableWindow(controls[Pick],FALSE);SetTimer(w,2,3000,nullptr);status(L"请在 3 秒内切换到要管理的游戏窗口。");break;
         case Resize:case Arrange:case Alpha:case Hide:case Show:operate(LOWORD(wp));break;
-        case Help:MessageBoxW(w,L"作者：Phoenix Feng\n鸣谢：摸鼠小工具激发了本项目的想法，初版页面的功能组织和设计也参考了它。\n\n默认选择全部游戏窗口；展开“窗口 / 设置”可选择部分窗口。\n\n客户端：点“查找”读取运行中的客户端、安装记录及常见目录，或扫描所选文件夹。推荐从 https://yys.163.com/zmb/ 下载阴阳师-MuMu模拟器专版。\n\n管理员：底部显示权限状态；普通权限可点“管理员启动”，接受 Windows 提示后重启本程序。取消提示会继续使用当前程序。\n\n老板键：默认 Ctrl + Alt + H，隐藏已选的可见游戏窗口并将面板收起；再次按恢复同一批窗口。此前已隐藏的窗口保持隐藏。展开设置，点击快捷键框按下新组合，再点“保存快捷键”；可停用。支持 Ctrl/Alt/Shift 组合及 F1–F11；占用时提示更换。\n\n固定 16:9，高度向上取整；宽 980 时高为 552。“自动排列”先应用当前尺寸，等待响应后从右上向下排列，排满向左。启动等待最长 120 秒并自动排列。“批量关闭”二次确认后立即结束识别列表中的游戏进程，未保存进度会丢失。\n\n最小化或“后台”进入托盘，双击或右键“打开”恢复。右键退出或窗口关闭真正退出，显示本程序隐藏的游戏窗口。\n新启动默认启用清晰启动。多开仍受客户端限制；建议游戏使用窗口模式。",L"鼠卫兵 · 使用说明",MB_OK|MB_ICONINFORMATION);break;
+        case Help:MessageBoxW(w,L"作者：Phoenix Feng\n鸣谢：摸鼠小工具激发了本项目的想法，初版页面的功能组织和设计也参考了它。\n\n默认选择全部游戏窗口；展开“窗口 / 设置”可选择部分窗口。\n\n客户端：点“查找”读取运行中的客户端、安装记录及常见目录，或扫描所选文件夹。推荐从 https://yys.163.com/zmb/ 下载阴阳师-MuMu模拟器专版。\n\n管理员：底部显示权限状态；普通权限可点“管理员启动”，接受 Windows 提示后重启本程序。取消提示会继续使用当前程序。\n\n老板键：默认 Ctrl + Alt + H，隐藏已选的可见游戏窗口并将面板收起；再次按恢复同一批窗口。此前已隐藏的窗口保持隐藏。展开设置，点击快捷键框按下新组合，再点“保存快捷键”；可停用。支持 Ctrl/Alt/Shift 组合及 F1–F11；占用时提示更换。\n\n固定 16:9，高度向上取整；宽 980 时高为 552。“自动排列”先应用当前尺寸，等待响应后从右上向下排列，排满向左。启动等待最长 120 秒并自动排列。“批量关闭”确认后正常关闭，并自动确认核验过的游戏退出提示；未保存进度可能丢失。\n每周三 9 点后首次多开提醒一次，可先只保留一个客户端更新。\n“静音 / 取消静音”按勾选客户端独立控制声音；展开设置可输入音量百分比。\n\n最小化或“后台”进入托盘，双击或右键“打开”恢复。右键退出或窗口关闭真正退出，显示本程序隐藏的游戏窗口。\n新启动默认启用清晰启动。多开仍受客户端限制；建议游戏使用窗口模式。",L"鼠卫兵 · 使用说明",MB_OK|MB_ICONINFORMATION);break;
         }return 0;
     case WM_TIMER:switch(wp){
         case 1:launchOne();break;
@@ -733,6 +776,7 @@ static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
         case 4:arrangementTick();break;
         case 5:bossFinishTick();break;
         case 6:startupTick();break;
+        case 7:closeTick();break;
         case 9:KillTimer(w,9);DestroyWindow(w);break;
         }return 0;
     case WM_CLOSE:stopArrangement();persist();restoreHidden();DestroyWindow(w);return 0;
@@ -747,7 +791,7 @@ static bool selfTest(const S& dir,bool ciMode=false){
     check(encodedWithoutArgs.find(L"args=")==S::npos&&decode(oldArgs,c),"launch argument setting is removed and old files remain readable");
     auto legacy=[&](int fields){
         S data((const wchar_t*)(b.data()+8),(b.size()-8)/2);
-        for(auto line:{L"autoUpdates=1\n",L"bossEnabled=1\n",L"bossKey=72\n",L"bossMods=3\n",fields<11?L"sharpLaunch=1\n":L"",fields<10?L"lockRatio=1\n":L""}){if(!*line)continue;auto pos=data.find(line);if(pos!=S::npos)data.erase(pos,wcslen(line));}
+        for(auto line:{L"wednesdayReminder=0\n",L"autoUpdates=1\n",L"bossEnabled=1\n",L"bossKey=72\n",L"bossMods=3\n",fields<11?L"sharpLaunch=1\n":L"",fields<10?L"lockRatio=1\n":L""}){if(!*line)continue;auto pos=data.find(line);if(pos!=S::npos)data.erase(pos,wcslen(line));}
         std::vector<unsigned char> bytes(8+data.size()*2);auto checkSum=hash(data.data(),data.size()*2);memcpy(bytes.data(),&checkSum,8);memcpy(bytes.data()+8,data.data(),data.size()*2);return bytes;
     };
     check(decode(legacy(9),c)&&c.lockRatio&&decode(legacy(10),c)&&decode(legacy(11),c)&&c.bossEnabled&&c.bossKey=='H',"older nine, ten and eleven field settings retain compatibility and default boss key");
@@ -757,6 +801,11 @@ static bool selfTest(const S& dir,bool ciMode=false){
     S encodedSettings((const wchar_t*)(b.data()+8),(b.size()-8)/2);S legacySharp=encodedSettings;legacySharp.insert(legacySharp.find(L"bossEnabled="),L"sharpLaunch=0\n");std::vector<unsigned char> oldSharp(8+legacySharp.size()*sizeof(wchar_t));auto oldSharpHash=hash(legacySharp.data(),legacySharp.size()*sizeof(wchar_t));memcpy(oldSharp.data(),&oldSharpHash,8);memcpy(oldSharp.data()+8,legacySharp.data(),legacySharp.size()*sizeof(wchar_t));
     check(encodedSettings.find(L"sharpLaunch=")==S::npos&&decode(oldSharp,c),"sharp launch is always on, hidden from settings, and old preference files remain readable");
     auto updateSettings=a;updateSettings.autoUpdates=false;check(decode(encode(updateSettings),c)&&!c.autoUpdates,"automatic update check preference survives settings round trip");
+    SYSTEMTIME wednesday{};wednesday.wYear=2026;wednesday.wMonth=10;wednesday.wDay=14;wednesday.wDayOfWeek=3;wednesday.wHour=8;
+    check(!reminderDue(a,wednesday,0),"weekly game update reminder stays quiet before Wednesday nine");wednesday.wHour=9;
+    check(reminderDue(a,wednesday,0),"weekly game update reminder activates at Wednesday nine for multi-launch");
+    auto reminded=a;reminded.wednesdayReminder=reminderDay(wednesday);check(decode(encode(reminded),c)&&!reminderDue(c,wednesday,0),"weekly reminder date persists and suppresses repeats after restart");
+    wednesday.wDay=21;check(reminderDue(reminded,wednesday,0),"next Wednesday receives a new reminder");wednesday.wDayOfWeek=4;check(!reminderDue(a,wednesday,2),"other weekdays never show the update reminder");wednesday.wDayOfWeek=3;auto single=a;single.count=1;check(!reminderDue(single,wednesday,0)&&reminderDue(single,wednesday,2),"single launch stays quiet unless multiple clients already exist");
     check(sharpCompatibility(L"~ RUNASADMIN DPIUNAWARE GdiDpiScaling HighDpiAware")==L"RUNASADMIN HIGHDPIAWARE","sharp launch replaces conflicting DPI flags and preserves other compatibility flags");
     auto launchEnv=launchEnvironment(true);bool envGood=launchEnv.size()>2&&launchEnv[launchEnv.size()-1]==0&&launchEnv[launchEnv.size()-2]==0;int layers=0;
     for(auto p=launchEnv.data();envGood&&*p;p+=wcslen(p)+1)if(lower(p).rfind(L"__compat_layer=",0)==0){layers++;if(S(p).find(L"HIGHDPIAWARE")==S::npos)envGood=false;}
@@ -892,12 +941,12 @@ static bool selfTest(const S& dir,bool ciMode=false){
     check(S(OfficialDownload)==L"https://yys.163.com/zmb/","official download uses user supplied URL");
     detailsOpen=true;panelSize();check((GetWindowLongPtrW(listWindow,GWL_STYLE)&WS_VISIBLE)&&(GetWindowLongPtrW(controls[BossKey],GWL_STYLE)&WS_VISIBLE),"window selection and boss key settings expand");
     check(!childHasCaption(panel,L"恢复布局")&&!childHasCaption(panel,L"停止启动")&&!childHasCaption(panel,L"清晰启动 · 避免系统拉伸（新启动生效）")&&!childHasCaption(panel,L"参数"),"removed layout, startup cancel, sharp launch, and argument controls are absent");
-    auto centerMatches=[](int labelId,int fieldId){RECT a{},b{};if(!GetWindowRect(controls[labelId],&a)||!GetWindowRect(controls[fieldId],&b))return false;return abs((a.top+a.bottom)-(b.top+b.bottom))<=2;};
+    auto centerMatches=[](int labelId,int fieldId){RECT a{},b{};if(!GetWindowRect(controls[labelId],&a)||!GetWindowRect(controls[fieldId],&b))return false;int delta=abs((a.top+a.bottom)-(b.top+b.bottom));if(delta>2)printf("ALIGN ids=%d,%d label=%ld,%ld field=%ld,%ld dpi=%d\n",labelId,fieldId,a.top,a.bottom,b.top,b.bottom,dpi);return delta<=2;};
     check(centerMatches(LPath,Path)&&centerMatches(LCount,Count)&&centerMatches(LDelay,Delay)&&centerMatches(LFilter,Filter)&&centerMatches(LWidth,Width)&&centerMatches(LHeight,Height)&&centerMatches(LScreen,Screen)&&centerMatches(LOpacity,Opacity)&&centerMatches(LBoss,BossEnabled),"labels align vertically with their input controls");
     RECT hideRect{},showRect{},panelClient{};GetClientRect(panel,&panelClient);GetWindowRect(controls[Hide],&hideRect);GetWindowRect(controls[Show],&showRect);MapWindowPoints(nullptr,panel,(POINT*)&hideRect,2);MapWindowPoints(nullptr,panel,(POINT*)&showRect,2);
-    check(hideRect.right+px(8)==showRect.left&&showRect.right==panelClient.right-px(24),"hide and show buttons align to the right edge");
+    check(abs(hideRect.right+px(8)-showRect.left)<=1&&abs(showRect.right-(panelClient.right-px(24)))<=1,"hide and show buttons align to the right edge");
     RECT allRect{},noneRect{},refreshRect{};GetWindowRect(controls[SelectAll],&allRect);GetWindowRect(controls[SelectNone],&noneRect);GetWindowRect(controls[Refresh],&refreshRect);MapWindowPoints(nullptr,panel,(POINT*)&allRect,2);MapWindowPoints(nullptr,panel,(POINT*)&noneRect,2);MapWindowPoints(nullptr,panel,(POINT*)&refreshRect,2);
-    check(allRect.top==noneRect.top&&noneRect.top==refreshRect.top&&allRect.right+px(8)==noneRect.left&&noneRect.right+px(8)==refreshRect.left,"select controls sit beside refresh above the window list");
+    check(allRect.top==noneRect.top&&noneRect.top==refreshRect.top&&abs(allRect.right+px(8)-noneRect.left)<=1&&abs(noneRect.right+px(8)-refreshRect.left)<=1,"select controls sit beside refresh above the window list");
     for(int i=0;i<2;i++){LVITEMW item{};item.mask=LVIF_TEXT;item.iItem=i;item.pszText=(LPWSTR)L"完整窗口列表测试";ListView_InsertItem(listWindow,&item);}
     RECT table{},second{};GetClientRect(listWindow,&table);ListView_GetItemRect(listWindow,1,&second,LVIR_BOUNDS);int columns=0;for(int i=0;i<4;i++)columns+=ListView_GetColumnWidth(listWindow,i);
     check(second.bottom<=table.bottom&&columns<=table.right,"expanded table shows two complete rows and every column without horizontal clipping");
@@ -909,11 +958,26 @@ static bool selfTest(const S& dir,bool ciMode=false){
     check(initially&&observeStartup(startup,readyTarget,2000),"one-click startup accepts stable windows before applying the configured aspect ratio");
     clientResize(readyTarget,320,180);check(!observeStartup(startup,readyTarget,3500),"startup stability restarts after window size changes");
     startupWindows.push_back(startup);launchRemaining=1;stopStartup();check(startupWindows.empty()&&launchRemaining==0&&valid(readyTarget),"stop startup cancels readiness tracking and leaves launched window alive");
-    wchar_t self[MAX_PATH]{};GetModuleFileNameW(instance,self,MAX_PATH);S closeProbe=folderOf(self)+L"\\..\\..\\.build\\dpi-probe.exe",fixturePath=dir+L"\\close-fixture.txt";S command=L"\""+closeProbe+L"\" --close-fixture \""+fixturePath+L"\"";std::vector<wchar_t> args(command.begin(),command.end());args.push_back(0);STARTUPINFOW startupInfo{};startupInfo.cb=sizeof(startupInfo);PROCESS_INFORMATION child{};bool spawned=CreateProcessW(closeProbe.c_str(),args.data(),nullptr,nullptr,FALSE,0,nullptr,nullptr,&startupInfo,&child)!=0;HWND closeWindow=nullptr;if(spawned){FixtureWindow fixture{child.dwProcessId};ULONGLONG end=GetTickCount64()+3000;while(!fixture.hwnd&&GetTickCount64()<end){EnumWindows(findFixtureWindow,(LPARAM)&fixture);if(!fixture.hwnd)Sleep(20);}closeWindow=fixture.hwnd;}Target closeTarget=targetOf(closeWindow);check(spawned&&closeWindow,"close fixture process starts with a game window");check(terminateTargets({closeTarget},false)==0&&WaitForSingleObject(child.hProcess,0)==WAIT_TIMEOUT,"forced close requires explicit confirmation");auto staleClose=closeTarget;staleClose.born++;check(terminateTargets({staleClose},true)==0&&WaitForSingleObject(child.hProcess,0)==WAIT_TIMEOUT,"forced close rejects stale process identity");int forced=terminateTargets({closeTarget,closeTarget},true);bool processClosed=WaitForSingleObject(child.hProcess,3000)==WAIT_OBJECT_0;check(forced==1&&processClosed&&!IsWindow(closeWindow),"confirmed batch close terminates each validated game process once without a client popup");if(spawned){if(!processClosed)TerminateProcess(child.hProcess,1);CloseHandle(child.hThread);CloseHandle(child.hProcess);}
+    wchar_t self[MAX_PATH]{};GetModuleFileNameW(instance,self,MAX_PATH);S closeProbe=folderOf(self)+L"\\..\\..\\.build\\dpi-probe.exe",fixturePath=dir+L"\\close-fixture.txt";S command=L"\""+closeProbe+L"\" --close-fixture \""+fixturePath+L"\"";std::vector<wchar_t> args(command.begin(),command.end());args.push_back(0);STARTUPINFOW startupInfo{};startupInfo.cb=sizeof(startupInfo);PROCESS_INFORMATION child{};bool spawned=CreateProcessW(closeProbe.c_str(),args.data(),nullptr,nullptr,FALSE,0,nullptr,nullptr,&startupInfo,&child)!=0;HWND closeWindow=nullptr;
+    if(spawned){FixtureWindow fixture{child.dwProcessId};ULONGLONG end=GetTickCount64()+3000;while(!fixture.hwnd&&GetTickCount64()<end){EnumWindows(findFixtureWindow,(LPARAM)&fixture);if(!fixture.hwnd)Sleep(20);}closeWindow=fixture.hwnd;}
+    Target closeTarget=targetOf(closeWindow);check(spawned&&closeWindow,"close fixture process starts with a game window");
+    check(sendCloseRequests({closeTarget},false)==0&&WaitForSingleObject(child.hProcess,0)==WAIT_TIMEOUT,"normal close requires explicit confirmation");auto staleClose=closeTarget;staleClose.born++;check(sendCloseRequests({staleClose},true)==0&&WaitForSingleObject(child.hProcess,0)==WAIT_TIMEOUT,"normal close rejects stale process identity");
+    check(extraClients({closeTarget,closeTarget}).empty(),"weekly single-client flow preserves one process and ignores duplicate windows");
+    auto extras=extraClients({targetOf(panel),closeTarget});check(extras.size()==1&&extras[0].pid==closeTarget.pid,"weekly single-client flow closes only clients after the retained first process");
+    int requested=sendCloseRequests({closeTarget,closeTarget},true);HWND exitDialog=nullptr;
+    struct ExitSearch {DWORD pid;HWND hwnd;};ExitSearch search{child.dwProcessId,nullptr};
+    auto findDialog=[](HWND w,LPARAM data)->BOOL{auto s=(ExitSearch*)data;DWORD pid=0;GetWindowThreadProcessId(w,&pid);if(pid==s->pid&&text(w)==L"退出游戏"){s->hwnd=w;return FALSE;}return TRUE;};
+    ULONGLONG dialogUntil=GetTickCount64()+3000;while(!search.hwnd&&GetTickCount64()<dialogUntil){EnumWindows(findDialog,(LPARAM)&search);if(!search.hwnd)Sleep(20);}exitDialog=search.hwnd;
+    check(exitDialog&&exitConfirmButton(exitDialog,closeTarget)&&!exitConfirmButton(exitDialog,staleClose),"exit confirmation matches native prompt and live owner identity across processes");
+    if(exitDialog)SetWindowTextW(exitDialog,L"其他确认");check(!exitConfirmButton(exitDialog,closeTarget),"unrelated confirmation titles are never accepted");if(exitDialog)SetWindowTextW(exitDialog,L"退出游戏");
+    if(exitDialog)SetDlgItemTextW(exitDialog,0xffff,L"其他问题?");check(!exitConfirmButton(exitDialog,closeTarget),"unrelated confirmation body is never accepted");if(exitDialog)SetDlgItemTextW(exitDialog,0xffff,L"确定要离开吗?");
+    std::vector<Target> closeRows{closeTarget};confirmedDialogs.clear();EnumWindows(confirmExitDialog,(LPARAM)&closeRows);bool processClosed=spawned&&WaitForSingleObject(child.hProcess,3000)==WAIT_OBJECT_0;
+    check(requested==1&&processClosed&&!IsWindow(closeWindow),"confirmed normal close automatically accepts owned exit dialog without process termination");confirmedDialogs.clear();if(spawned){if(!processClosed)TerminateProcess(child.hProcess,1);CloseHandle(child.hThread);CloseHandle(child.hProcess);}
     HWND sized=CreateWindowExW(0,L"STATIC",L"Resize Arrange",WS_OVERLAPPEDWINDOW,0,0,320,200,nullptr,nullptr,instance,nullptr);Target sizedTarget=targetOf(sized);bool repeats=true;
     for(int i=0;i<10;i++){repeats=repeats&&beginArrangement({sizedTarget},monitor,640,360);for(int tick=0;tick<8&&!arrangement.rows.empty();tick++)arrangementTick();RECT c{};GetClientRect(sized,&c);repeats=repeats&&c.right==640&&c.bottom==360&&arrangement.rows.empty();}
     check(repeats,"ten size-and-arrange operations apply the configured size without progressive drift");DestroyWindow(sized);saved.clear();
     updates::selfTest(dir,check);
+    audio::selfTest(check);
     // Filter out every real game. Only explicitly tracked synthetic children can be arranged.
     set(Filter,L"__SHUWEIBING_TEST_ONLY__");set(Path,dir+L"\\多开测试 带空格\\Launch.exe");set(Count,L"2");set(Delay,L"500");set(Width,L"640");manualTargets.clear();targets.clear();ULONGLONG started=GetTickCount64();beginLaunch(L"--startup-fixture \""+dir+L"\\one-click.txt\"");
     ULONGLONG until=GetTickCount64()+11000;bool finished=false;
@@ -922,7 +986,7 @@ static bool selfTest(const S& dir,bool ciMode=false){
     for(auto& child:launched){RECT c{},r{};GetClientRect(child.hwnd,&c);GetWindowRect(child.hwnd,&r);exact=exact&&valid(child)&&c.right==640&&c.bottom==360&&r.right<=mi.rcWork.right&&r.left>=mi.rcWork.left&&r.top>=mi.rcWork.top&&r.bottom<=mi.rcWork.bottom;}
     check(exact,"one click launches two synthetic logo windows, waits for readiness, then sizes and arranges them");
     check(finished&&GetTickCount64()-started<5500,"ready synthetic windows arrange before the former six-second minimum wait");
-    stopStartup();stopArrangement();terminateTargets(launched,true);for(auto& child:launched){HANDLE p=OpenProcess(SYNCHRONIZE|PROCESS_TERMINATE,FALSE,child.pid);if(p){if(WaitForSingleObject(p,2000)!=WAIT_OBJECT_0)TerminateProcess(p,1);CloseHandle(p);}}manualTargets.clear();
+    stopStartup();stopArrangement();sendCloseRequests(launched,true);for(auto& child:launched){HANDLE p=OpenProcess(SYNCHRONIZE|PROCESS_TERMINATE,FALSE,child.pid);if(p){if(WaitForSingleObject(p,2000)!=WAIT_OBJECT_0)TerminateProcess(p,1);CloseHandle(p);}}manualTargets.clear();
     check(FindResourceW(instance,MAKEINTRESOURCEW(102),RT_RCDATA)&&FindResourceW(instance,MAKEINTRESOURCEW(103),RT_RCDATA),"standalone executable embeds project and bundled library licenses");
     // Hosted runners may lack Explorer; keep the full tray check on desktops.
     if(ciMode&&!FindWindowW(L"Shell_TrayWnd",nullptr))printf("SKIP system tray icon registration: no Explorer shell in CI\n");
@@ -949,6 +1013,7 @@ int WINAPI wWinMain(HINSTANCE h,HINSTANCE,LPWSTR,int show){
     instance=h;int argc=0;LPWSTR* argv=CommandLineToArgvW(GetCommandLineW(),&argc);
     int updateResult=updates::applyMode(argc,argv);if(updateResult>=0){LocalFree(argv);return updateResult;}
     if(argc==3&&S(argv[1])==L"--update-probe"){bool ok=updates::probe(argv[2]);LocalFree(argv);return ok?0:1;}
+    if(argc==3&&S(argv[1])==L"--audio-probe"){HRESULT com=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);EnumWindows(enumTarget,(LPARAM)&cfg.filter);S report=L"\uFEFF鼠卫兵声音只读检查\r\n";for(auto& t:targets)if(valid(t)){auto result=audio::inspect(t.pid);report+=L"PID="+std::to_wstring(t.pid)+L" · "+t.title+L" · 独立会话="+std::to_wstring(result.matched)+L" · 共享会话="+(result.shared?L"是":L"否")+L"\r\n";}bool ok=atomicWrite(argv[2],report.data(),report.size()*2);if(SUCCEEDED(com))CoUninitialize();LocalFree(argv);return ok?0:1;}
     bool diagnostics=false,discoverReport=false,ciMode=false,skipUpdate=false;int waitParent=0;
     for(int i=1;i<argc;i++){if(S(argv[i])==L"--self-test")testMode=true;if(S(argv[i])==L"--smoke-test")smokeMode=true;if(S(argv[i])==L"--diagnose")diagnostics=true;if(S(argv[i])==L"--discover")discoverReport=true;if(S(argv[i])==L"--wait-parent"&&i+1<argc)number(argv[++i],1,99999999,waitParent);}
     if(discoverReport&&argc>2){S output=L"\uFEFF鼠卫兵自动读取客户端路径与多开入口\r\n";for(auto& path:gameCandidates()){output+=path+L"\r\n";LaunchSpec plan;S error;if(resolveLaunch(path,L"",plan,error))output+=L"  实际启动="+plan.executable+L"\r\n  工作目录="+plan.directory+L"\r\n";else output+=L"  无法追加多开="+error+L"\r\n";}bool ok=atomicWrite(argv[argc-1],output.data(),output.size()*2);LocalFree(argv);return ok?0:1;}

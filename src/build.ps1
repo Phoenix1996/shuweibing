@@ -12,7 +12,7 @@ try {
     if($LASTEXITCODE -ne 0){throw '资源编译失败'}
     & $Zig cc -target x86_64-windows-gnu -std=c99 -Os -DYYJSON_DISABLE_WRITER=1 -DYYJSON_DISABLE_UTILS=1 -c third_party/yyjson/yyjson.c -o '../.build/yyjson.o'
     if($LASTEXITCODE -ne 0){throw 'JSON 解析库编译失败'}
-    & $Zig c++ -target x86_64-windows-gnu -std=c++17 -Os -s -fno-exceptions -fno-rtti -municode '-Wl,--subsystem,windows' main.cpp updater.cpp '../.build/yyjson.o' app.res -lwinhttp -lbcrypt -lversion -lcomctl32 -lcomdlg32 -lshell32 -lole32 -luuid -ldwmapi -ladvapi32 -lgdi32 -luxtheme -o $output
+    & $Zig c++ -target x86_64-windows-gnu -std=c++17 -Os -s -fno-exceptions -fno-rtti -municode '-Wl,--subsystem,windows' main.cpp updater.cpp audio.cpp '../.build/yyjson.o' app.res -lwinhttp -lbcrypt -lversion -lcomctl32 -lcomdlg32 -lshell32 -lole32 -luuid -ldwmapi -ladvapi32 -lgdi32 -luxtheme -o $output
     if($LASTEXITCODE -ne 0){throw 'C++ 编译失败'}
     $file=Get-Item -LiteralPath $output
     if($file.VersionInfo.ProductVersion -ne $version){throw '程序资源版本与 VERSION 不一致'}
